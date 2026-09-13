@@ -94,9 +94,8 @@ jobs:
             echo "Protected tag $tag does not resolve exactly to $CANDIDATE_SHA" >&2
             exit 1
           fi
-          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
-          echo "architecture=$CANDIDATE_ARCH" >> "$GITHUB_OUTPUT"
-          echo "runner=$runner" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "candidate_sha=$CANDIDATE_SHA" \
+            "architecture=$CANDIDATE_ARCH" "runner=$runner" >> "$GITHUB_OUTPUT"
 
   build-unsigned:
     name: Build candidate without signing secrets
