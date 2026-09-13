@@ -317,6 +317,16 @@ Because an apply rewrites summary-derived frontmatter, everything computed from 
 
 ### Desktop app
 
+macOS source builds require the macOS 26 SDK from Xcode 26 or newer, including
+when the resulting app will run on macOS 15. The older Xcode 16 command-line
+tools do not include the Apple Speech declarations used by the build. Select
+an installed Xcode 26 before building; for example, with Xcode 26.3 installed:
+
+```bash
+export DEVELOPER_DIR=/Applications/Xcode_26.3.app/Contents/Developer
+xcrun --sdk macosx --show-sdk-version  # must report 26 or newer
+```
+
 ```bash
 # macOS — Homebrew cask (recommended)
 brew install --cask silverstein/tap/minutes
