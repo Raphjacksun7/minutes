@@ -6250,12 +6250,24 @@ fn cmd_transcribe(path: &Path, output_json: bool, do_diarize: bool, config: &Con
     let result = minutes_core::transcribe::transcribe(path, config)
         .map_err(|e| anyhow::anyhow!("transcription failed: {}", e))?;
 
-    if !output_json {
-        // Plain-text mode: emit the cleaned transcript unchanged
-        print!("{}", result.text.trim_end());
-        println!();
-        return Ok(());
-    }
+    let output = format_transcribe_result(&result, output_json, do_diarize, config, || {
+        minutes_core::diarize::diarize(path, config)
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+/// Keep optional diarization on the shared execution path for both renderers.
+/// The injected operation lets regressions prove text mode actually runs it,
+/// without loading a model or requiring an audio device in the CLI test suite.
+fn format_transcribe_result(
+    result: &minutes_core::transcribe::TranscribeResult,
+    output_json: bool,
+    do_diarize: bool,
+    config: &Config,
+    diarize: impl FnOnce() -> Option<minutes_core::diarize::DiarizationResult>,
+) -> Result<String> {
+    let diarization = if do_diarize { diarize() } else { None };
 
     let duration_ms = (result.stats.audio_duration_secs * 1000.0) as u64;
 
@@ -6269,40 +6281,26 @@ fn cmd_transcribe(path: &Path, output_json: bool, do_diarize: bool, config: &Con
         .unwrap_or_else(|| "unknown".to_string());
 
     // Build output segments from the core result (real timestamps, no scraping).
-    let segments: Vec<TranscribeSegmentOutput> = if do_diarize {
-        let diarize_result = minutes_core::diarize::diarize(path, config);
-        if let Some(dr) = diarize_result {
-            result
-                .segments
-                .iter()
-                .map(|seg| {
-                    // Attribute this segment to the diarization speaker whose
-                    // window best overlaps [seg.start, seg.end].
-                    let speaker = dr
-                        .segments
-                        .iter()
-                        .find(|s| s.start < seg.end && s.end > seg.start)
-                        .map(|s| s.speaker.clone());
-                    TranscribeSegmentOutput {
-                        start: seg.start,
-                        end: seg.end,
-                        text: seg.text.clone(),
-                        speaker,
-                    }
-                })
-                .collect()
-        } else {
-            result
-                .segments
-                .iter()
-                .map(|seg| TranscribeSegmentOutput {
+    let segments: Vec<TranscribeSegmentOutput> = if let Some(dr) = diarization {
+        result
+            .segments
+            .iter()
+            .map(|seg| {
+                // Preserve JSON's first-overlapping-window attribution in
+                // both formats; no overlap means no speaker label.
+                let speaker = dr
+                    .segments
+                    .iter()
+                    .find(|s| s.start < seg.end && s.end > seg.start)
+                    .map(|s| s.speaker.clone());
+                TranscribeSegmentOutput {
                     start: seg.start,
                     end: seg.end,
                     text: seg.text.clone(),
-                    speaker: None,
-                })
-                .collect()
-        }
+                    speaker,
+                }
+            })
+            .collect()
     } else {
         result
             .segments
@@ -6315,6 +6313,30 @@ fn cmd_transcribe(path: &Path, output_json: bool, do_diarize: bool, config: &Con
             })
             .collect()
     };
+
+    if !output_json {
+        if !do_diarize || segments.is_empty() {
+            return Ok(result.text.trim_end().to_owned());
+        }
+        return Ok(segments
+            .iter()
+            .map(|segment| {
+                let seconds = segment.start.max(0.0) as u64;
+                let prefix = segment
+                    .speaker
+                    .as_ref()
+                    .map(|speaker| format!("{speaker}: "))
+                    .unwrap_or_default();
+                format!(
+                    "[{}:{:02}] {prefix}{}",
+                    seconds / 60,
+                    seconds % 60,
+                    segment.text.trim()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
 
     // data.text: segment texts joined with newlines (clean, no [m:ss] prefixes).
     // Falls back to result.text when segments are empty (e.g. parakeet engine).
@@ -6349,9 +6371,7 @@ fn cmd_transcribe(path: &Path, output_json: bool, do_diarize: bool, config: &Con
         duration_ms,
     };
     let envelope = json_envelope("transcribe", data);
-    println!("{}", serde_json::to_string_pretty(&envelope)?);
-
-    Ok(())
+    Ok(serde_json::to_string_pretty(&envelope)?)
 }
 
 fn cmd_process(
@@ -12427,6 +12447,107 @@ life (qmd://life/)
             "speaker field must be omitted when None, got: {}",
             json
         );
+    }
+
+    fn transcribe_render_fixture() -> minutes_core::transcribe::TranscribeResult {
+        use minutes_core::transcribe::{FilterStats, TranscribeResult, TranscriptSegment};
+        TranscribeResult {
+            text: "[0:00] First turn.\n[0:12] Second turn.\n[0:15] Unmatched.\n".into(),
+            stats: FilterStats {
+                audio_duration_secs: 17.0,
+                ..Default::default()
+            },
+            segments: vec![
+                TranscriptSegment {
+                    start: 0.0,
+                    end: 4.0,
+                    text: "First turn.".into(),
+                },
+                TranscriptSegment {
+                    start: 12.0,
+                    end: 15.0,
+                    text: "Second turn.".into(),
+                },
+                TranscriptSegment {
+                    start: 15.0,
+                    end: 17.0,
+                    text: "Unmatched.".into(),
+                },
+            ],
+            detected_language: Some("en".into()),
+        }
+    }
+
+    #[test]
+    fn transcribe_diarization_runs_in_text_and_json_with_matching_speakers() {
+        use minutes_core::diarize::{DiarizationResult, SpeakerSegment};
+        let result = transcribe_render_fixture();
+        for output_json in [false, true] {
+            let mut calls = 0;
+            let output =
+                format_transcribe_result(&result, output_json, true, &Config::default(), || {
+                    calls += 1;
+                    Some(DiarizationResult {
+                        segments: vec![
+                            SpeakerSegment {
+                                start: 0.0,
+                                end: 4.0,
+                                speaker: "SPEAKER_1".into(),
+                            },
+                            SpeakerSegment {
+                                start: 12.0,
+                                end: 15.0,
+                                speaker: "SPEAKER_2".into(),
+                            },
+                        ],
+                        num_speakers: 2,
+                        ..Default::default()
+                    })
+                })
+                .unwrap();
+            assert_eq!(calls, 1, "requested diarization must run in either format");
+            if output_json {
+                let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+                assert_eq!(json["data"]["segments"][0]["speaker"], "SPEAKER_1");
+                assert_eq!(json["data"]["segments"][1]["speaker"], "SPEAKER_2");
+                assert!(json["data"]["segments"][2].get("speaker").is_none());
+                assert_eq!(json["data"]["duration_ms"], 17000);
+            } else {
+                assert_eq!(output, "[0:00] SPEAKER_1: First turn.\n[0:12] SPEAKER_2: Second turn.\n[0:15] Unmatched.");
+            }
+        }
+    }
+
+    #[test]
+    fn transcribe_without_diarization_preserves_text_and_skips_the_engine() {
+        let result = transcribe_render_fixture();
+        let output = format_transcribe_result(&result, false, false, &Config::default(), || {
+            panic!("diarization was not requested")
+        })
+        .unwrap();
+        assert_eq!(output, result.text.trim_end());
+    }
+
+    #[test]
+    fn transcribe_unavailable_diarization_does_not_invent_speaker_labels() {
+        let result = transcribe_render_fixture();
+        let output =
+            format_transcribe_result(&result, false, true, &Config::default(), || None).unwrap();
+        assert_eq!(output, result.text.trim_end());
+    }
+
+    #[test]
+    fn transcribe_without_timed_segments_preserves_text_after_requested_diarization() {
+        let mut result = transcribe_render_fixture();
+        result.segments.clear();
+        let mut called = false;
+        let output = format_transcribe_result(&result, false, true, &Config::default(), || {
+            called = true;
+            Some(Default::default())
+        })
+        .unwrap();
+        assert!(called);
+        assert_eq!(output, result.text.trim_end());
     }
 }
 

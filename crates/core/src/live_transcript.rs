@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::error::{LiveTranscriptError, MinutesError, TranscribeError};
 use crate::live_partials::{LivePartialPublisher, SupersessionReason};
 use crate::pid;
+use crate::sidecar_timing::SidecarWorkerTimings;
 use crate::streaming::AudioStream;
 use crate::streaming_whisper::StreamingWhisper;
 use crate::transcription_coordinator::{collapse_noise_markers, strip_foreign_script};
@@ -2123,6 +2124,12 @@ const SIDECAR_DRAFT_INTERVAL_SAMPLES: usize = 16000 * 2;
 const SIDECAR_FIRST_DRAFT_SAMPLES: usize = 16000;
 
 #[cfg(feature = "whisper")]
+struct SidecarUtteranceJob {
+    samples: Vec<f32>,
+    queued_at: Instant,
+}
+
+#[cfg(feature = "whisper")]
 struct SidecarDraftJob {
     utterance_sequence: u64,
     samples: Vec<f32>,
@@ -2306,14 +2313,21 @@ fn lock_ignore_poison<'a, T>(mutex: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T
 
 #[cfg(feature = "whisper")]
 fn enqueue_sidecar_utterance(
-    job_tx: &std::sync::mpsc::SyncSender<Vec<f32>>,
+    job_tx: &std::sync::mpsc::SyncSender<SidecarUtteranceJob>,
     samples: Vec<f32>,
     counters: &QueueCounters,
 ) -> EnqueueResult {
     if samples.is_empty() {
         return EnqueueResult::Disconnected;
     }
-    let outcome = try_send_drop_newest(job_tx, samples, counters);
+    let outcome = try_send_drop_newest(
+        job_tx,
+        SidecarUtteranceJob {
+            samples,
+            queued_at: Instant::now(),
+        },
+        counters,
+    );
     match outcome {
         EnqueueResult::Queued | EnqueueResult::Disconnected => {}
         EnqueueResult::DroppedFull => {
@@ -2329,11 +2343,28 @@ fn enqueue_sidecar_utterance(
 
 #[cfg(feature = "whisper")]
 fn finish_sidecar_utterance(
-    job_tx: &std::sync::mpsc::SyncSender<Vec<f32>>,
+    job_tx: &std::sync::mpsc::SyncSender<SidecarUtteranceJob>,
     samples: Vec<f32>,
     counters: &QueueCounters,
 ) {
     enqueue_sidecar_utterance(job_tx, samples, counters);
+}
+
+#[cfg(feature = "whisper")]
+fn write_timed_sidecar_utterance(
+    writer: &Mutex<Option<LiveTranscriptWriter>>,
+    text: &str,
+    duration_secs: f64,
+    timings: &mut SidecarWorkerTimings,
+) {
+    let started = Instant::now();
+    let mut guard = lock_ignore_poison(writer);
+    timings.writer_lock_wait.observe(started.elapsed());
+    if let Some(w) = guard.as_mut() {
+        timings
+            .writer_write
+            .measure(|| w.write_utterance(text, duration_secs));
+    }
 }
 
 /// Engine dispatch for one finalized utterance on the sidecar's transcription
@@ -2347,10 +2378,14 @@ fn transcribe_utterance_for_sidecar(
     whisper_ctx: &mut Option<whisper_rs::WhisperContext>,
     parakeet_enabled: &mut bool,
     stop_flag: &Arc<AtomicBool>,
+    timings: &mut SidecarWorkerTimings,
 ) -> Option<(String, f64)> {
     #[cfg(feature = "parakeet")]
     if *parakeet_enabled {
-        match transcribe_with_parakeet_for_live_sidecar(samples, config) {
+        match timings
+            .final_inference
+            .measure(|| transcribe_with_parakeet_for_live_sidecar(samples, config))
+        {
             Ok(result) => return result,
             Err(error) => {
                 tracing::warn!(
@@ -2368,7 +2403,10 @@ fn transcribe_utterance_for_sidecar(
     }
     let ctx = match whisper_ctx {
         Some(ctx) => ctx,
-        None => match load_sidecar_whisper_ctx(config) {
+        None => match timings
+            .whisper_model_load
+            .measure(|| load_sidecar_whisper_ctx(config))
+        {
             Ok(ctx) => whisper_ctx.insert(ctx),
             Err(error) => {
                 tracing::warn!(
@@ -2391,12 +2429,14 @@ fn transcribe_utterance_for_sidecar(
             }
         },
     };
-    transcribe_with_whisper_for_live_sidecar(
-        samples,
-        ctx,
-        config.transcription.language.clone(),
-        Some(stop_flag),
-    )
+    timings.final_inference.measure(|| {
+        transcribe_with_whisper_for_live_sidecar(
+            samples,
+            ctx,
+            config.transcription.language.clone(),
+            Some(stop_flag),
+        )
+    })
 }
 
 #[cfg(feature = "whisper")]
@@ -3037,7 +3077,8 @@ fn run_sidecar_inner_mpsc(
     // buffering; finalized utterances are handed to this worker over a small
     // bounded queue, and a backlogged engine costs us utterances (counted in
     // the status file) instead of the whole session.
-    let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(SIDECAR_UTTERANCE_QUEUE_CAP);
+    let (job_tx, job_rx) =
+        std::sync::mpsc::sync_channel::<SidecarUtteranceJob>(SIDECAR_UTTERANCE_QUEUE_CAP);
     let queue_counters = Arc::new(QueueCounters::default());
     let draft_jobs = Arc::new(SidecarDraftMailbox::<SidecarDraftJob>::default());
     let draft_results = Arc::new(SidecarDraftMailbox::<SidecarDraftResult>::default());
@@ -3052,6 +3093,7 @@ fn run_sidecar_inner_mpsc(
         std::thread::Builder::new()
             .name("live-sidecar-transcribe".into())
             .spawn(move || {
+                let mut timings = SidecarWorkerTimings::default();
                 let mut parakeet_enabled = parakeet_live_enabled;
                 // Loaded lazily on first whisper-path utterance: the load can
                 // take >10s for larger models, and doing it eagerly (worse, on
@@ -3059,7 +3101,10 @@ fn run_sidecar_inner_mpsc(
                 // every meeting. Parakeet sessions never pay it at all.
                 let mut whisper_ctx: Option<whisper_rs::WhisperContext> = None;
                 if drafts_enabled {
-                    match load_sidecar_whisper_ctx(&config) {
+                    match timings
+                        .whisper_model_load
+                        .measure(|| load_sidecar_whisper_ctx(&config))
+                    {
                         Ok(ctx) => whisper_ctx = Some(ctx),
                         Err(error) => tracing::warn!(
                             error = %error,
@@ -3069,7 +3114,7 @@ fn run_sidecar_inner_mpsc(
                 }
                 let mut finals_disconnected = false;
                 loop {
-                    let final_samples = match job_rx.try_recv() {
+                    let final_job = match job_rx.try_recv() {
                         Ok(samples) => Some(samples),
                         Err(std::sync::mpsc::TryRecvError::Empty) => None,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -3077,23 +3122,30 @@ fn run_sidecar_inner_mpsc(
                             None
                         }
                     };
-                    if let Some(samples) = final_samples {
+                    if let Some(job) = final_job {
                         if stop_flag.load(Ordering::Relaxed) {
+                            timings.finals_skipped_at_stop =
+                                timings.finals_skipped_at_stop.saturating_add(1);
                             counters.pending.fetch_sub(1, Ordering::Relaxed);
                             continue;
                         }
+                        timings.final_queue_wait.observe(job.queued_at.elapsed());
                         let result = transcribe_utterance_for_sidecar(
-                            &samples,
+                            &job.samples,
                             &config,
                             &mut whisper_ctx,
                             &mut parakeet_enabled,
                             &stop_flag,
+                            &mut timings,
                         );
                         counters.pending.fetch_sub(1, Ordering::Relaxed);
                         if let Some((text, duration_secs)) = result {
-                            if let Some(w) = lock_ignore_poison(&writer).as_mut() {
-                                w.write_utterance(&text, duration_secs);
-                            }
+                            write_timed_sidecar_utterance(
+                                &writer,
+                                &text,
+                                duration_secs,
+                                &mut timings,
+                            );
                         }
                         continue;
                     }
@@ -3101,8 +3153,12 @@ fn run_sidecar_inner_mpsc(
                     if stop_flag.load(Ordering::Relaxed) {
                         draft_jobs.clear();
                     } else if let Some(job) = draft_jobs.take() {
+                        timings.drafts_taken = timings.drafts_taken.saturating_add(1);
                         if whisper_ctx.is_none() {
-                            match load_sidecar_whisper_ctx(&config) {
+                            match timings
+                                .whisper_model_load
+                                .measure(|| load_sidecar_whisper_ctx(&config))
+                            {
                                 Ok(ctx) => whisper_ctx = Some(ctx),
                                 Err(error) => tracing::warn!(
                                     error = %error,
@@ -3111,15 +3167,21 @@ fn run_sidecar_inner_mpsc(
                             }
                         }
                         if let Some(ctx) = whisper_ctx.as_ref() {
-                            if let Some((text, _)) = transcribe_with_whisper_for_live_sidecar(
-                                &job.samples,
-                                ctx,
-                                config.transcription.language.clone(),
-                                Some(&stop_flag),
-                            )
-                            .and_then(|(text, duration)| {
-                                normalize_live_transcript_text(&text).map(|text| (text, duration))
-                            }) {
+                            if let Some((text, _)) = timings
+                                .draft_inference
+                                .measure(|| {
+                                    transcribe_with_whisper_for_live_sidecar(
+                                        &job.samples,
+                                        ctx,
+                                        config.transcription.language.clone(),
+                                        Some(&stop_flag),
+                                    )
+                                })
+                                .and_then(|(text, duration)| {
+                                    normalize_live_transcript_text(&text)
+                                        .map(|text| (text, duration))
+                                })
+                            {
                                 draft_results.offer_latest(SidecarDraftResult {
                                     utterance_sequence: job.utterance_sequence,
                                     text,
@@ -3136,23 +3198,30 @@ fn run_sidecar_inner_mpsc(
                     }
 
                     match job_rx.recv_timeout(Duration::from_millis(25)) {
-                        Ok(samples) => {
+                        Ok(job) => {
                             if stop_flag.load(Ordering::Relaxed) {
+                                timings.finals_skipped_at_stop =
+                                    timings.finals_skipped_at_stop.saturating_add(1);
                                 counters.pending.fetch_sub(1, Ordering::Relaxed);
                                 continue;
                             }
+                            timings.final_queue_wait.observe(job.queued_at.elapsed());
                             let result = transcribe_utterance_for_sidecar(
-                                &samples,
+                                &job.samples,
                                 &config,
                                 &mut whisper_ctx,
                                 &mut parakeet_enabled,
                                 &stop_flag,
+                                &mut timings,
                             );
                             counters.pending.fetch_sub(1, Ordering::Relaxed);
                             if let Some((text, duration_secs)) = result {
-                                if let Some(w) = lock_ignore_poison(&writer).as_mut() {
-                                    w.write_utterance(&text, duration_secs);
-                                }
+                                write_timed_sidecar_utterance(
+                                    &writer,
+                                    &text,
+                                    duration_secs,
+                                    &mut timings,
+                                );
                             }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -3161,6 +3230,7 @@ fn run_sidecar_inner_mpsc(
                         }
                     }
                 }
+                timings
             })
             .map_err(|e| MinutesError::from(TranscribeError::Io(e)))?
     };
@@ -3307,7 +3377,7 @@ fn run_sidecar_inner_mpsc(
     // in-flight engine call is bounded by the parakeet subprocess timeout),
     // then finalize.
     drop(job_tx);
-    let _ = worker.join();
+    let worker_timings = worker.join().ok();
 
     let (lines, duration, _path) = match lock_ignore_poison(&writer).take() {
         Some(w) => w.finalize(),
@@ -3365,6 +3435,7 @@ fn run_sidecar_inner_mpsc(
             "dropped_utterances": dropped_utterances,
             "skipped_utterances": SIDECAR_SKIPPED_UTTERANCES.load(Ordering::Relaxed),
             "whisper_failures": crate::streaming_whisper::failure_count(),
+            "worker_timing": worker_timings,
         }),
     );
 
@@ -3832,23 +3903,26 @@ mod tests {
 
     #[test]
     fn sidecar_utterance_queue_drops_newest_when_full_and_counts() {
-        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<SidecarUtteranceJob>(2);
         let counters = QueueCounters::default();
 
         enqueue_sidecar_utterance(&tx, vec![0.1; 1600], &counters);
-        enqueue_sidecar_utterance(&tx, vec![0.1; 1600], &counters);
+        enqueue_sidecar_utterance(&tx, vec![0.2; 1600], &counters);
         // Queue full — this one must be dropped, not block the caller.
-        enqueue_sidecar_utterance(&tx, vec![0.1; 1600], &counters);
+        enqueue_sidecar_utterance(&tx, vec![0.3; 1600], &counters);
         // Empty utterances are a no-op either way.
         enqueue_sidecar_utterance(&tx, Vec::new(), &counters);
 
         assert_eq!(counters.pending.load(Ordering::Relaxed), 2);
         assert_eq!(counters.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(rx.try_recv().unwrap().samples, vec![0.1; 1600]);
+        assert_eq!(rx.try_recv().unwrap().samples, vec![0.2; 1600]);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
     fn sidecar_utterance_queue_disconnected_worker_is_silent() {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<SidecarUtteranceJob>(2);
         drop(rx);
         let counters = QueueCounters::default();
 
@@ -4003,6 +4077,33 @@ mod tests {
             assert_eq!(status.pending_utterances, None);
             assert_eq!(status.dropped_utterances, None);
             assert_eq!(status.diagnostic, None);
+        });
+    }
+
+    #[test]
+    fn timed_sidecar_writer_preserves_the_transcript_without_logging_its_text() {
+        with_temp_home(|| {
+            let writer = Mutex::new(Some(
+                LiveTranscriptWriter::new(
+                    &Config::default(),
+                    None,
+                    TranscriptSource::RecordingSidecar,
+                )
+                .unwrap(),
+            ));
+            let mut timings = SidecarWorkerTimings::default();
+            let text = "Synthetic discussion content stays in the transcript.";
+            write_timed_sidecar_utterance(&writer, text, 2.5, &mut timings);
+            let (lines, _, path) = lock_ignore_poison(&writer).take().unwrap().finalize();
+            assert_eq!(lines, 1);
+            let line: TranscriptLine =
+                serde_json::from_str(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+            assert_eq!(line.text, text);
+            assert_eq!(line.duration_ms, 2500);
+            let diagnostic = serde_json::to_value(timings).unwrap();
+            assert_eq!(diagnostic["writer_lock_wait"]["count"], 1);
+            assert_eq!(diagnostic["writer_write"]["count"], 1);
+            assert!(!diagnostic.to_string().contains(text));
         });
     }
 
@@ -5182,6 +5283,21 @@ mod tests {
                 !pid::live_transcript_status_path().exists(),
                 "a normal recording stop must not leave stale sidecar state"
             );
+            let log = std::fs::read_to_string(crate::logging::log_path()).unwrap();
+            let summaries: Vec<serde_json::Value> = log
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|entry| entry["step"] == "live_sidecar_ended")
+                .collect();
+            assert_eq!(summaries.len(), 1, "one summary, not per-job timing logs");
+            let timing = &summaries[0]["extra"]["worker_timing"];
+            assert!(
+                timing.is_object(),
+                "the joined worker must return its timings"
+            );
+            assert_eq!(timing["final_queue_wait"]["count"], 0);
+            assert_eq!(timing["whisper_model_load"]["count"], 0);
+            assert_eq!(timing["drafts_taken"], 0);
         });
     }
 
