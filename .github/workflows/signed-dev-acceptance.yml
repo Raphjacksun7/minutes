@@ -119,6 +119,23 @@ jobs:
           test "$(uname -m)" = "$CANDIDATE_ARCH"
           printf '%s\n' "$CANDIDATE_SHA" > candidate-sha.txt
 
+      - name: Select the Speech-capable SDK on Intel
+        if: needs.authorize-candidate.outputs.architecture == 'x86_64'
+        run: |
+          set -euo pipefail
+          test -d /Applications/Xcode_26.3.app/Contents/Developer
+          echo "DEVELOPER_DIR=/Applications/Xcode_26.3.app/Contents/Developer" >> "$GITHUB_ENV"
+
+      - name: Check the Swift bridge before building Rust dependencies
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          xcrun swiftc -typecheck -parse-as-library \
+            -target "$(uname -m)-apple-macos11.0" \
+            crates/core/src/macos_graph_xpc_authority.swift \
+            crates/core/src/macos_apple_speech_bridge.swift
+
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
 
