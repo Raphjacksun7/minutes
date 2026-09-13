@@ -151,6 +151,8 @@ pub mod dictation;
 // Live transcript mode (requires streaming + whisper)
 #[cfg(all(feature = "streaming", feature = "whisper"))]
 pub mod live_transcript;
+#[cfg(any(test, all(feature = "streaming", feature = "whisper")))]
+mod sidecar_timing;
 
 // Native macOS hotkey monitoring via CGEventTap
 #[cfg(target_os = "macos")]
