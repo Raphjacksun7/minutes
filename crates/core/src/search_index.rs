@@ -1484,6 +1484,53 @@ mod tests {
     }
 
     #[test]
+    fn production_search_accepts_an_ordinary_state_root_without_private_stores() {
+        let _guard = crate::test_home_env_lock();
+        let (dir, config) = temp_config();
+        let home = dir.path().join("home");
+        let state = home.join(".minutes");
+        std::fs::create_dir_all(&state).unwrap();
+        // Restore the process-wide settings even if a regression panics.
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (name, value) in &self.0 {
+                    if let Some(value) = value {
+                        std::env::set_var(name, value);
+                    } else {
+                        std::env::remove_var(name);
+                    }
+                }
+            }
+        }
+        let _restore = RestoreEnv(
+            ["HOME", "MINUTES_HOME"]
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect(),
+        );
+        std::env::set_var("HOME", &home);
+        std::env::set_var("MINUTES_HOME", &state);
+        write_meeting(
+            &config.output_dir,
+            "fresh",
+            "Fresh installation",
+            "searchcanary",
+        );
+
+        let index = SearchIndex::open(&config).unwrap();
+        index.sync(&config, SyncMode::Auto).unwrap();
+        let matches = index
+            .search("searchcanary", &SearchFilters::default(), None)
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].title, "Fresh installation");
+        assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
+        #[cfg(windows)]
+        assert!(crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(&state).is_err());
+    }
+
+    #[test]
     fn production_index_is_process_private_and_creates_no_cache_sidecars() {
         let _guard = crate::test_home_env_lock();
         let (dir, config) = temp_config();
