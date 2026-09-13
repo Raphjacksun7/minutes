@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::cli_install_detection::{
+#[path = "cli_install_detection.rs"]
+mod cli_install_detection;
+
+use self::cli_install_detection::{
     executable_candidates, find_homebrew, homebrew_owns_binary, known_install_method,
 };
 use serde::{Deserialize, Serialize};

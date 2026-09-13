@@ -19,8 +19,6 @@ static PARAKEET_FEATURE_SENTINEL: &[u8] = b"transcribe_parakeet parakeet_helper\
 
 mod call_capture;
 mod call_detect;
-#[cfg(all(unix, any(target_os = "macos", test)))]
-mod cli_install_detection;
 #[cfg(target_os = "macos")]
 mod cli_setup;
 mod commands;
