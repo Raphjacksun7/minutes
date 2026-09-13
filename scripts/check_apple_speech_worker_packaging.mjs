@@ -14,7 +14,7 @@ const EXPECTED_SOURCE_SHA256 = {
   acceptanceWorkflow:
     "16340f6b0a1aa4002e3c9f449c40b7212f4122f94a57c4174a58f756f671a217",
   acceptanceHarness:
-    "454e9eab87dba92a492f8e85d84db81b1f6bf6e6c38b330e8592fa16cf95dc9c",
+    "bcb7900e80cff2446d66aaae0937e779552ea77f6cb555cf158e5016d936d43d",
 };
 
 const files = {
