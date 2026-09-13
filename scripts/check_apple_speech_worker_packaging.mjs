@@ -47,6 +47,7 @@ const files = {
   // rpaths are load-bearing and must not silently regress.
   coreBuild: readFileSync("crates/core/build.rs", "utf8"),
   cliBuild: readFileSync("crates/cli/build.rs", "utf8"),
+  tauriBuild: readFileSync("tauri/src-tauri/build.rs", "utf8"),
 };
 
 
@@ -193,6 +194,11 @@ function validate(candidate, checkGoldens = true) {
     activeCode(candidate.coreBuild),
     "cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift",
     "minutes-core's own targets must add the Swift Concurrency runtime rpath",
+  );
+  requireText(
+    activeCode(candidate.tauriBuild),
+    "cargo:rustc-link-arg-bin=minutes-app=-Wl,-rpath,/usr/lib/swift",
+    "the desktop app must add the Swift runtime rpath to its own binary",
   );
 
   for (const value of [
@@ -462,6 +468,11 @@ if (process.argv.includes("--self-test")) {
       value.replace(
         '"cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift"',
         '// "cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift"',
+      ), false],
+    ["desktop app Concurrency rpath commented out", "tauriBuild", (value) =>
+      value.replace(
+        '"cargo:rustc-link-arg-bin=minutes-app=-Wl,-rpath,/usr/lib/swift"',
+        '// "cargo:rustc-link-arg-bin=minutes-app=-Wl,-rpath,/usr/lib/swift"',
       ), false],
     ["xpc_main aliased to a block declaration", "xpc", (value) =>
       value.replace(
