@@ -7432,6 +7432,14 @@ fn cmd_setup(model: &str, list: bool, diarization: bool) -> Result<()> {
     let model_dir = &config.transcription.model_path;
     std::fs::create_dir_all(model_dir)?;
 
+    // MCP clients can start several server processes at once. Each one may
+    // discover the same missing model and invoke setup concurrently. Keep the
+    // entire setup transaction behind one cross-process lock so those callers
+    // re-check the final model after the first download completes instead of
+    // truncating each other's shared `.partial` file. The lock also covers the
+    // shared VAD download and config update below.
+    let _setup_lock = acquire_model_setup_lock(model_dir)?;
+
     let dest = model_dir.join(format!("ggml-{}.bin", model));
     let expected_min_bytes = minutes_core::transcribe::expected_whisper_model_size_bytes(model);
     let mb = |bytes: u64| bytes as f64 / 1_048_576.0;
@@ -7526,6 +7534,22 @@ fn cmd_setup(model: &str, list: bool, diarization: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn acquire_model_setup_lock(model_dir: &Path) -> Result<std::fs::File> {
+    use fs2::FileExt;
+
+    let lock_path = model_dir.join(".minutes-model-setup.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open model setup lock at {}", lock_path.display()))?;
+    lock.lock_exclusive()
+        .with_context(|| format!("failed to lock model setup at {}", lock_path.display()))?;
+    Ok(lock)
 }
 
 fn cmd_setup_vad() -> Result<()> {
@@ -9549,6 +9573,26 @@ life (qmd://life/)
         let fallback = setup_plan_for(None, false, false);
         assert_eq!(fallback.whisper_model, "small");
         assert!(!fallback.install_sherpa);
+    }
+
+    #[test]
+    fn model_setup_lock_excludes_a_second_process_handle() {
+        use fs2::FileExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let first = acquire_model_setup_lock(temp.path()).unwrap();
+        let lock_path = temp.path().join(".minutes-model-setup.lock");
+        let second = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+
+        assert!(second.try_lock_exclusive().is_err());
+        drop(first);
+        second
+            .try_lock_exclusive()
+            .expect("the next setup process can continue after the first finishes");
     }
 
     #[test]
