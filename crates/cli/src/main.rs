@@ -4254,11 +4254,7 @@ where
 
     for (index, snapshot) in authorized.iter().enumerate() {
         let frontmatter = &snapshot.frontmatter;
-        let content_type = match frontmatter.r#type {
-            ContentType::Meeting => "meeting",
-            ContentType::Memo => "memo",
-            ContentType::Dictation => "dictation",
-        };
+        let content_type = frontmatter.r#type.as_str();
         let date = frontmatter.date.to_rfc3339();
         let path = snapshot.path.display().to_string();
         // This is the final source-policy action before the row sink. Never

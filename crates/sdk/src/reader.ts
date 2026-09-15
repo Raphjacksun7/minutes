@@ -344,7 +344,7 @@ export function parseFrontmatter(
     }
     if (
       typeof parsed.type !== "string" ||
-      !["meeting", "memo", "dictation"].includes(parsed.type)
+      !["meeting", "memo", "dictation", "note"].includes(parsed.type)
     ) {
       return null;
     }

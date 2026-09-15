@@ -868,13 +868,26 @@ pub(crate) fn stable_active_corpus_revision_with_budget_and_snapshot_hook(
     })
 }
 
-/// Content types for output files.
+/// Content types for corpus artifacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ContentType {
     Meeting,
     Memo,
     Dictation,
+    Note,
+}
+
+impl ContentType {
+    /// Stable value used in Markdown frontmatter and derived indexes.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Meeting => "meeting",
+            Self::Memo => "memo",
+            Self::Dictation => "dictation",
+            Self::Note => "note",
+        }
+    }
 }
 
 /// Output status markers.
@@ -1141,7 +1154,7 @@ impl RecordingHealth {
     }
 }
 
-/// Frontmatter for a meeting/memo markdown file.
+/// Frontmatter for a corpus Markdown file.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Frontmatter {
     pub title: String,
@@ -1595,6 +1608,7 @@ fn write_with_retry_policy(
         ContentType::Memo => config.output_dir.join("memos"),
         ContentType::Meeting => config.output_dir.clone(),
         ContentType::Dictation => config.output_dir.join("dictations"),
+        ContentType::Note => config.output_dir.clone(),
     };
 
     // Ensure output directory exists

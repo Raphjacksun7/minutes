@@ -26,7 +26,7 @@ use crate::config::Config;
 use crate::error::SearchError;
 use crate::markdown::{
     extract_field, read_stable_active_markdown, split_frontmatter, ActiveCorpusReadBudget,
-    ContentType, Frontmatter, Sensitivity, StableActiveCorpusRevision, StableMarkdownSnapshot,
+    Frontmatter, Sensitivity, StableActiveCorpusRevision, StableMarkdownSnapshot,
 };
 use crate::search::{SearchFilters, SearchResult};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -731,12 +731,7 @@ impl SearchIndex {
         // Preserve the legacy SearchResult date representation after the
         // typed parse has established that the field exists and is valid.
         let date = extract_field(frontmatter, "date").unwrap_or_else(|| parsed.date.to_rfc3339());
-        let content_type = match parsed.r#type {
-            ContentType::Meeting => "meeting",
-            ContentType::Memo => "memo",
-            ContentType::Dictation => "dictation",
-        }
-        .to_string();
+        let content_type = parsed.r#type.as_str().to_string();
         let mtime_ns = meta
             .modified()
             .ok()
@@ -1179,11 +1174,7 @@ fn restricted_live_result(
     if frontmatter.sensitivity != Some(Sensitivity::Restricted) {
         return None;
     }
-    let content_type = match frontmatter.r#type {
-        ContentType::Meeting => "meeting",
-        ContentType::Memo => "memo",
-        ContentType::Dictation => "dictation",
-    };
+    let content_type = frontmatter.r#type.as_str();
     if filters
         .content_type
         .as_deref()

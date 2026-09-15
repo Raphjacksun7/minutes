@@ -192,7 +192,7 @@ interface MeetingFile {
 
 interface Frontmatter {
   title: string;
-  type: string;      // "meeting" | "memo" | "dictation"
+  type: string;      // "meeting" | "memo" | "dictation" | "note"
   date: string;      // ISO 8601
   duration: string;
   source?: string;   // "voice-memos" | "dictation" | undefined

@@ -36,7 +36,7 @@ schema version bump. Additive fields do not.
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `title` | string | ✓ | Human-readable title. LLM-generated during ingest, editable. |
-| `type` | enum | ✓ | One of: `meeting`, `memo`, `dictation`. |
+| `type` | enum | ✓ | One of: `meeting`, `memo`, `dictation`, `note`. |
 | `date` | datetime | ✓ | ISO-8601 with timezone. Example: `2026-03-17T14:00:00-07:00`. |
 | `duration` | string | ✓ | Human-friendly, e.g. `42m`, `1h 5m`. |
 
