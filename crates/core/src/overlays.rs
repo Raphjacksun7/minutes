@@ -1060,7 +1060,7 @@ pub(crate) fn stable_speaker_overlay_snapshot_at_until(
             | OpenFlags::SQLITE_OPEN_NOFOLLOW
             | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
     )?;
-    conn.progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline));
+    conn.progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline))?;
     conn.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA query_only=ON; BEGIN")?;
     let temp_mode: i64 = conn.query_row("PRAGMA temp_store", [], |row| row.get(0))?;
     if temp_mode != 2 {

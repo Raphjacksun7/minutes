@@ -2824,7 +2824,7 @@ fn rebuild_in_memory_projection_with_hook(
     conn.progress_handler(
         1_000,
         Some(move || progress_budget.check_deadline().is_err()),
-    );
+    )?;
     populate_projection_with_hook(
         config,
         conn,
@@ -2949,7 +2949,7 @@ pub(crate) fn populate_policy_projection_from_stream(
     conn.progress_handler(
         1_000,
         Some(move || progress_budget.check_deadline().is_err()),
-    );
+    )?;
     let corrections = GraphCorrectionSnapshot {
         vocabulary_people,
         speaker_overlays: overlays::StableSpeakerOverlaySnapshot::empty(),
