@@ -19,7 +19,7 @@ const EXPECTED_SOURCE_SHA256 = {
   authority: "2275155b7dd21b47bb0e3a2d79b90ca550d9f27e9997f072cf30e13dde707cf4",
   helperPlist: "543617b03e757520a201bd0a7751cc6aadb48cf0d6b4a44bfc9ef4323a69850f",
   helperEntry: "0efe701412d909021d6ae784eac941e7d9b9d1a0f2ee0f3144bcb15fc2b2ba18",
-  cliCargo: "535d4cd9bbfe60e403c343159376a4f45465879c6278caa6e413c1f0a41fc185",
+  cliCargo: "1d5a652297a62f4f566ad74e7e8b70eaacac9d2e3c2d42db5f11be3b0e94c147",
 };
 
 const sources = {
