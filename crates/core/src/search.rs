@@ -159,11 +159,7 @@ fn policy_verified_result(
         crate::search_index::live_fts_match_snippet(&frontmatter.title, body, live_query_trimmed)
     }?;
     if filters.content_type.as_ref().is_some_and(|expected| {
-        let actual = match frontmatter.r#type {
-            crate::markdown::ContentType::Meeting => "meeting",
-            crate::markdown::ContentType::Memo => "memo",
-            crate::markdown::ContentType::Dictation => "dictation",
-        };
+        let actual = frontmatter.r#type.as_str();
         actual != expected
     }) {
         return None;
@@ -222,11 +218,7 @@ fn policy_verified_result(
     result.path = snapshot.path.clone();
     result.title = frontmatter.title;
     result.date = live_date;
-    result.content_type = match frontmatter.r#type {
-        crate::markdown::ContentType::Meeting => "meeting".into(),
-        crate::markdown::ContentType::Memo => "memo".into(),
-        crate::markdown::ContentType::Dictation => "dictation".into(),
-    };
+    result.content_type = frontmatter.r#type.as_str().into();
     result.snippet = live_snippet;
     Some((result, is_restricted))
 }
@@ -1692,11 +1684,7 @@ fn cross_meeting_research_once(
             continue;
         }
 
-        let content_type = match frontmatter.r#type {
-            crate::markdown::ContentType::Meeting => "meeting".to_string(),
-            crate::markdown::ContentType::Memo => "memo".to_string(),
-            crate::markdown::ContentType::Dictation => "dictation".to_string(),
-        };
+        let content_type = frontmatter.r#type.as_str().to_string();
         let speaker_overlays = speaker_overlay_map(&frontmatter, &overlay_db_path, path);
         if let Some(ref type_filter) = filters.content_type {
             if content_type != *type_filter {
@@ -2322,11 +2310,7 @@ fn consistency_report_at_once(
                         path: path.clone(),
                         title: frontmatter.title.clone(),
                         date: frontmatter.date.to_rfc3339(),
-                        content_type: match frontmatter.r#type {
-                            crate::markdown::ContentType::Meeting => "meeting".to_string(),
-                            crate::markdown::ContentType::Memo => "memo".to_string(),
-                            crate::markdown::ContentType::Dictation => "dictation".to_string(),
-                        },
+                        content_type: frontmatter.r#type.as_str().to_string(),
                     });
 
             let mut reasons = Vec::new();
@@ -2461,11 +2445,7 @@ fn person_profile_once(
         std::collections::HashMap::new();
 
     for (path, frontmatter) in parsed_frontmatters {
-        let content_type = match frontmatter.r#type {
-            crate::markdown::ContentType::Meeting => "meeting".to_string(),
-            crate::markdown::ContentType::Memo => "memo".to_string(),
-            crate::markdown::ContentType::Dictation => "dictation".to_string(),
-        };
+        let content_type = frontmatter.r#type.as_str().to_string();
         let date = frontmatter.date.to_rfc3339();
         let speaker_overlays = speaker_overlay_map(&frontmatter, &overlay_db_path, &path);
 
@@ -2681,11 +2661,7 @@ fn process_intent_snapshot(
     }
 
     let date = frontmatter.date.to_rfc3339();
-    let content_type = match frontmatter.r#type {
-        crate::markdown::ContentType::Meeting => "meeting".to_string(),
-        crate::markdown::ContentType::Memo => "memo".to_string(),
-        crate::markdown::ContentType::Dictation => "dictation".to_string(),
-    };
+    let content_type = frontmatter.r#type.as_str().to_string();
 
     if let Some(ref type_filter) = filters.content_type {
         if content_type != *type_filter {
@@ -2993,6 +2969,58 @@ mod tests {
         let results = search("pricing", &config, &filters).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].snippet.contains("pricing"));
+    }
+
+    #[test]
+    fn note_artifacts_participate_in_list_and_search_without_bypassing_policy() {
+        let _guard = crate::test_support::home_env_lock();
+        let dir = TempDir::new().unwrap();
+        create_test_file(
+            dir.path(),
+            "2026-09-15-launch-prep.md",
+            "---\ntitle: Launch Prep\ntype: note\ndate: 2026-09-15T10:00:00Z\n---\n\nLaunch checklist canary.",
+        );
+        create_test_file(
+            dir.path(),
+            "2026-09-15-private-prep.md",
+            "---\ntitle: Private Prep\ntype: note\ndate: 2026-09-15T11:00:00Z\nsensitivity: restricted\n---\n\nLaunch private canary.",
+        );
+        let config = Config {
+            output_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let listed = search("", &config, &SearchFilters::default()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "Launch Prep");
+        assert_eq!(listed[0].content_type, "note");
+
+        let filtered = search(
+            "launch",
+            &config,
+            &SearchFilters {
+                content_type: Some("note".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].title, "Launch Prep");
+
+        let with_restricted = search(
+            "launch",
+            &config,
+            &SearchFilters {
+                content_type: Some("note".into()),
+                include_restricted: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(with_restricted.len(), 2);
+        assert!(with_restricted
+            .iter()
+            .any(|result| result.title == "Private Prep"));
     }
 
     #[test]

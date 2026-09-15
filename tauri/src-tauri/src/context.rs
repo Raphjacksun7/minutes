@@ -255,11 +255,7 @@ pub fn generate_meeting_context(meeting_path: &Path, config: &Config) -> Result<
     let fm: Frontmatter =
         serde_yaml::from_str(fm_str).map_err(|e| format!("Bad frontmatter: {}", e))?;
 
-    let content_type = match fm.r#type {
-        minutes_core::markdown::ContentType::Meeting => "meeting",
-        minutes_core::markdown::ContentType::Memo => "memo",
-        minutes_core::markdown::ContentType::Dictation => "dictation",
-    };
+    let content_type = fm.r#type.as_str();
 
     let mut md = String::with_capacity(4096);
     md.push_str("# Meeting Context\n\n");

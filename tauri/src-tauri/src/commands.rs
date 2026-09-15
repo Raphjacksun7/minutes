@@ -8829,12 +8829,7 @@ pub fn cmd_get_meeting_detail(path: String) -> Result<MeetingDetail, String> {
         ),
     }
 
-    let content_type = match frontmatter.r#type {
-        ContentType::Meeting => "meeting",
-        ContentType::Memo => "memo",
-        ContentType::Dictation => "dictation",
-    }
-    .to_string();
+    let content_type = frontmatter.r#type.as_str().to_string();
 
     let status = frontmatter.status.map(|status| {
         match status {

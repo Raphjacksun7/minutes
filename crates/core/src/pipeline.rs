@@ -4814,6 +4814,7 @@ fn write_transcript_artifact_with_authority(
             ContentType::Memo => Some("voice-memos".into()),
             ContentType::Meeting => None,
             ContentType::Dictation => Some("dictation".into()),
+            ContentType::Note => Some("note".into()),
         }
     };
     let tags = derive_structured_tags(
@@ -6108,6 +6109,7 @@ where
             ContentType::Memo => Some("voice-memos".into()),
             ContentType::Meeting => None,
             ContentType::Dictation => Some("dictation".into()),
+            ContentType::Note => Some("note".into()),
         }
     };
     let tags = derive_structured_tags(

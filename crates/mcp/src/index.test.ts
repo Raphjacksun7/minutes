@@ -4551,6 +4551,25 @@ describe("restricted content policy", () => {
     }
   });
 
+  it("accepts note artifacts without weakening frontmatter policy", () => {
+    const note = [
+      "---",
+      "title: Launch Prep",
+      "type: note",
+      "date: 2026-09-15T10:00:00Z",
+      "---",
+      "",
+      "Launch checklist.",
+    ].join("\n");
+    expect(parsePolicyVerifiedMeeting(note, "launch-prep.md")?.frontmatter.type).toBe("note");
+    expect(
+      parsePolicyVerifiedMeeting(
+        note.replace("type: note", "type: private-note"),
+        "invalid-note.md"
+      )
+    ).toBeNull();
+  });
+
   it("denies invalid UTF-8 policy bytes across exact, stable, research, and tool reads", async () => {
     const meetingsDir = mkdtempSync(join(tmpdir(), "minutes-invalid-utf8-policy-"));
     const invalidPath = join(meetingsDir, "invalid-utf8.md");
