@@ -14,9 +14,9 @@ import { NumberedSectionLabel as SectionLabel } from "@/components/section-label
 const featureGrid = [
   {
     label: "For agents",
-    title: "Local audio context",
+    title: "Searchable local context",
     description:
-      `${MINUTES_MCP_TOOL_COUNT} MCP tools, live transcript reads, and structured markdown let Claude, Codex, Gemini CLI, and Cowork work from what was actually said.`,
+      `${MINUTES_MCP_TOOL_COUNT} MCP tools, live transcript reads, and policy-aware search across meetings and notes let Claude, Codex, Gemini CLI, and Cowork work from what was actually said.`,
   },
   {
     label: "For developers",
@@ -116,7 +116,7 @@ const capabilityColumns = [
   },
 ] as const;
 
-// Public product documentation reviewed September 5, 2026. See linked comparisons.
+// Public product documentation reviewed September 15, 2026. See linked comparisons.
 const comparisons = [
   ["Product", "Hosted meeting notepad", "Hosted meeting assistant", "Local meeting notepad", "Local conversation memory"],
   ["Agent access", "Hosted MCP", "Hosted integrations", "CLI + MCP", `Files + ${MINUTES_MCP_TOOL_COUNT} MCP tools`],
@@ -374,7 +374,7 @@ export default function Home() {
 
         <p className="mx-auto mt-12 max-w-[620px] rounded-[5px] border border-[color:var(--border)] bg-[var(--bg-elevated)] px-4 py-3 font-mono text-[12px] leading-5 text-[var(--text-secondary)]">
           <span className="text-[var(--accent)]">v{MINUTES_RELEASE_VERSION}</span>{" "}
-          brings back the live transcript during recordings, which had been empty since 0.25.4, and now reports when transcription stalls instead of calling it healthy.{" "}
+          makes prep briefs and other Markdown notes visible in list and search, and prevents concurrent setup processes from racing over one model download.{" "}
           <a
             href={`https://github.com/silverstein/minutes/releases/tag/v${MINUTES_RELEASE_VERSION}`}
             className="text-[var(--text)] underline decoration-[color:var(--border-mid)] underline-offset-2 hover:text-[var(--accent)]"

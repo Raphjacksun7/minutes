@@ -524,6 +524,6 @@ Questions, feature requests, or interop issues belong in
 
 ---
 
-_Last updated: 2026-05-07 — corresponds to Minutes v0.16.3. Schema is
-unchanged since v0.13.2 frontmatter v2 additions (`authority`, `supersedes`
-on `Decision`)._
+_Last updated: 2026-09-15. Corresponds to Minutes v0.26.3, which added the
+`note` corpus type. The frontmatter v2 `authority` and `supersedes` fields on
+`Decision` are unchanged._
