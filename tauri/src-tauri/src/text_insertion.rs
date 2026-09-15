@@ -311,17 +311,23 @@ fn target_prefers_clipboard_paste(target: Option<&ActiveTargetContext>) -> bool 
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    [
-        "ghostty",
-        "terminal",
-        "iterm",
-        "wezterm",
-        "alacritty",
-        "kitty",
-        "warp",
-    ]
-    .iter()
-    .any(|marker| bundle_id.contains(marker) || app_name.contains(marker))
+    let is_minutes_webview = matches!(
+        bundle_id.as_str(),
+        "com.useminutes.desktop" | "com.useminutes.desktop.dev"
+    );
+
+    is_minutes_webview
+        || [
+            "ghostty",
+            "terminal",
+            "iterm",
+            "wezterm",
+            "alacritty",
+            "kitty",
+            "warp",
+        ]
+        .iter()
+        .any(|marker| bundle_id.contains(marker) || app_name.contains(marker))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -395,9 +401,11 @@ fn best_effort_verified(
 
     // Terminal accessibility trees can report a successful AXSelectedText
     // write without delivering anything to the live prompt. Route known
-    // terminals through the proven clipboard-paste path instead. Other native
-    // controls may use the faster direct path, but only a verified change is
-    // allowed to claim `Typed`.
+    // terminals through the proven clipboard-paste path instead. The embedded
+    // xterm surface is reported as the Minutes bundle rather than as a terminal
+    // app, so the owned production and development bundles use the same path.
+    // Other native controls may use the faster direct path, but only a verified
+    // change is allowed to claim `Typed`.
     let native_ax_error = if target_prefers_clipboard_paste(target_context.as_ref()) {
         "skipped for terminal target".to_string()
     } else {
@@ -1782,6 +1790,8 @@ mod tests {
             ("Terminal", "com.apple.Terminal"),
             ("iTerm2", "com.googlecode.iterm2"),
             ("Warp", "dev.warp.Warp-Stable"),
+            ("Minutes", "com.useminutes.desktop"),
+            ("Minutes Dev", "com.useminutes.desktop.dev"),
         ] {
             let target = ActiveTargetContext {
                 platform: "macos".into(),
