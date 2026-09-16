@@ -423,7 +423,7 @@ window.__MINUTES_I18N['pt-BR'] = {
     "Set Up Vault": "Configurar vault",
     "Unlink": "Desvincular",
     "Not configured. Meetings stay in ~/meetings/ — connect a vault to see them in Obsidian.": "Não configurado. As reuniões ficam em ~/meetings/; conecte um vault para vê-las no Obsidian.",
-    "Meetings, memos, and thoughts become structured markdown instead of disappearing into app state.": "Reuniões, memorandos e ideias viram markdown estruturado em vez de sumirem dentro do estado do app.",
+    "Meetings, memos, and thoughts become structured markdown instead of disappearing into app state.": "Reuniões, ideias rápidas e anotações viram markdown estruturado em vez de sumirem dentro do estado do app.",
     "Timeline, transcript, action items, and context stay queryable across desktop, CLI, and MCP surfaces.": "Linha do tempo, transcrição, itens de ação e contexto continuam consultáveis no app, na CLI e nas interfaces MCP.",
     "Configuration reference": "Referência de configuração",
     "Full list of every config key, its default, and what it does.": "Lista completa de cada chave de configuração, seu padrão e o que ela faz.",
@@ -617,7 +617,7 @@ window.__MINUTES_I18N['pt-BR'] = {
 
     // ── Rodapé contextual (concatenado com o tipo de conteúdo) ──
     "Have questions about this meeting?": "Tem dúvidas sobre esta reunião?",
-    "Have questions about this memo?": "Tem dúvidas sobre este memo?",
+    "Have questions about this memo?": "Tem dúvidas sobre esta ideia rápida?",
     "Have questions about this note?": "Tem dúvidas sobre esta nota?",
     "Have questions about this dictation?": "Tem dúvidas sobre este ditado?",
 
@@ -720,7 +720,7 @@ window.__MINUTES_I18N['pt-BR'] = {
     "Forward Delete": "Delete para frente",
     "Future Minutes app updates will automatically update the CLI through the symlink — no extra step.": "Atualizações futuras do app Minutes atualizam a CLI pelo link simbólico, sem passo extra.",
     "Generating meeting summary": "Gerando resumo da reunião",
-    "Generating memo summary": "Gerando resumo do memo",
+    "Generating memo summary": "Gerando resumo da ideia rápida",
     "Global shortcut is unavailable right now.": "O atalho global está indisponível no momento.",
     "Go Live": "Ir ao vivo",
     "I'll do it myself": "Eu mesmo faço",
@@ -796,7 +796,8 @@ window.__MINUTES_I18N['pt-BR'] = {
     "Ready to listen when you start dictation.": "Pronto para ouvir quando você iniciar o ditado.",
     "Ready to restart": "Pronto para reiniciar",
     "Recent context is available.": "Há contexto recente disponível.",
-    "Record Memo": "Gravar memo",
+    "Record Memo": "Gravar ideia rápida",
+    "Memo": "Ideia rápida",
     "Recording could not be started.": "Não foi possível iniciar a gravação.",
     "Recording is starting. Wait for the recorder to finish connecting.": "A gravação está iniciando. Espere o gravador terminar de conectar.",
     "Recording not started": "Gravação não iniciada",
@@ -811,7 +812,7 @@ window.__MINUTES_I18N['pt-BR'] = {
     "Resummarizing… this can take a minute.": "Resumindo de novo… isso pode levar um minuto.",
     "Retry Audio": "Repetir áudio",
     "Retry as Meeting": "Repetir como reunião",
-    "Retry as Memo": "Repetir como memo",
+    "Retry as Memo": "Repetir como ideia rápida",
     "Retrying...": "Tentando de novo...",
     "Revert failed": "Falha ao reverter",
     "Revert to Snapshot": "Reverter para o instantâneo",
@@ -1095,6 +1096,6 @@ window.__MINUTES_I18N['pt-BR'] = {
     { re: "^Ollama not reachable at (.+)$", to: "Ollama inacessível em $1" },
     { re: "^Phase: (.+)$", to: "Fase: $1" },
     { re: "^Using: (.+) \u2014 no API key needed, uses your existing subscription$", to: "Usando: $1, sem precisar de chave de API, usa sua assinatura atual" },
-    { re: "^Meetings: (.+) \\((\\d+) files\\) • Memos: (.+) \\((\\d+)\\) • Models: (.+) • Screenshots: (.+) • Total: (.+)$", to: "Reuniões: $1 ($2 arquivos) • Memos: $3 ($4) • Modelos: $5 • Capturas de tela: $6 • Total: $7" }
+    { re: "^Meetings: (.+) \\((\\d+) files\\) • Memos: (.+) \\((\\d+)\\) • Models: (.+) • Screenshots: (.+) • Total: (.+)$", to: "Reuniões: $1 ($2 arquivos) • Ideias rápidas: $3 ($4) • Modelos: $5 • Capturas de tela: $6 • Total: $7" }
   ]
 };
