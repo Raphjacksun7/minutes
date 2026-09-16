@@ -69,6 +69,7 @@ pub struct SessionSetup {
     pub system_instruction: String,
     pub function_declarations: Vec<Value>,
     pub language: String,
+    pub voice_name: String,
     /// `true` for push-to-talk: we send activityStart/activityEnd ourselves.
     pub manual_activity: bool,
     /// Let the model stay silent when speech was not addressed to it.
@@ -121,6 +122,11 @@ impl SessionSetup {
             "outputAudioTranscription": {},
             "contextWindowCompression": { "slidingWindow": {} },
         });
+        if !self.voice_name.trim().is_empty() {
+            setup["generationConfig"]["speechConfig"]["voiceConfig"] = json!({
+                "prebuiltVoiceConfig": { "voiceName": self.voice_name.trim() }
+            });
+        }
         if !self.function_declarations.is_empty() {
             setup["tools"] = json!([{ "functionDeclarations": declarations }]);
         }
@@ -583,6 +589,7 @@ mod tests {
                 json!({"name": "t", "parameters": {"type": "object", "properties": {}}}),
             ],
             language: "en-US".into(),
+            voice_name: String::new(),
             manual_activity: true,
             proactive_audio: false,
             start_sensitivity: "low".into(),
@@ -612,6 +619,21 @@ mod tests {
         );
         assert!(v["setup"]["inputAudioTranscription"].is_object());
         assert!(v["setup"]["outputAudioTranscription"].is_object());
+        assert!(v["setup"]["generationConfig"]["speechConfig"]
+            .get("voiceConfig")
+            .is_none());
+        for model in ["gemini-3.8-live", "gemini-3.8-live-extended-thinking"] {
+            let named = SessionSetup {
+                model: model.into(),
+                voice_name: "Charon".into(),
+                ..setup.clone()
+            };
+            assert_eq!(
+                named.to_json()["setup"]["generationConfig"]["speechConfig"]["voiceConfig"]
+                    ["prebuiltVoiceConfig"]["voiceName"],
+                "Charon"
+            );
+        }
     }
 
     #[test]
@@ -625,6 +647,7 @@ mod tests {
                 json!({"name": "t", "parameters": {"type": "object", "properties": {}}}),
             ],
             language: "en-US".into(),
+            voice_name: "Charon".into(),
             manual_activity: false,
             proactive_audio: false,
             start_sensitivity: String::new(),
@@ -633,6 +656,11 @@ mod tests {
         };
         let v = setup.to_json();
         assert_eq!(v["setup"]["sessionResumption"]["handle"], "handle-1");
+        assert_eq!(
+            v["setup"]["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]
+                ["voiceName"],
+            "Charon"
+        );
         // A resumed socket that lost the instructions or the tools would look
         // like the same conversation and behave like a different assistant.
         assert_eq!(
@@ -655,6 +683,7 @@ mod tests {
             function_declarations: vec![],
             language: "en-US".into(),
             manual_activity: false,
+            voice_name: String::new(),
             proactive_audio: true,
             start_sensitivity: String::new(),
             end_sensitivity: String::new(),
@@ -688,6 +717,7 @@ mod tests {
             function_declarations: vec![],
             language: "en-US".into(),
             manual_activity: false,
+            voice_name: String::new(),
             proactive_audio: false,
             start_sensitivity: "low".into(),
             end_sensitivity: "HIGH".into(),
@@ -713,6 +743,7 @@ mod tests {
             function_declarations: vec![],
             language: "en-US".into(),
             manual_activity: false,
+            voice_name: String::new(),
             proactive_audio: false,
             start_sensitivity: String::new(),
             end_sensitivity: String::new(),
@@ -796,6 +827,7 @@ mod tests {
             ],
             language: "en-US".into(),
             manual_activity: true,
+            voice_name: String::new(),
             proactive_audio: false,
             start_sensitivity: String::new(),
             end_sensitivity: String::new(),
@@ -871,6 +903,7 @@ mod tests {
                 system_instruction: crate::voice_live::system_prompt(&config, &names, false),
                 function_declarations: tools.declarations(),
                 language: "en-US".into(),
+                voice_name: config.voice_live.voice_name.clone(),
                 manual_activity: true,
                 proactive_audio: false,
                 start_sensitivity: String::new(),
@@ -928,6 +961,140 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires GEMINI_API_KEY and requests a short Charon voice response"]
+    fn live_morris_voice_smoke() {
+        let mut config = crate::config::Config::default();
+        config.voice_live.enabled = true;
+        config.voice_live.allow_cloud = true;
+        config.voice_live.persona = "morris".into();
+        config.voice_live.voice_name = "Charon".into();
+        let names = crate::voice_live::NameIndex::default();
+        let setup = SessionSetup {
+            model: config.voice_live.model.clone(),
+            thinking_level: config.voice_live.thinking_level.clone(),
+            api_key: crate::voice_live::api_key(&config).unwrap(),
+            system_instruction: crate::voice_live::system_prompt(&config, &names, false),
+            function_declarations: vec![],
+            language: config.voice_live.language.clone(),
+            voice_name: config.voice_live.voice_name.clone(),
+            manual_activity: true,
+            proactive_audio: false,
+            start_sensitivity: String::new(),
+            end_sensitivity: String::new(),
+            resume_handle: None,
+        };
+        let client = LiveClient::connect(&setup).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut audio_bytes = 0;
+        let mut transcript = String::new();
+        while std::time::Instant::now() < deadline {
+            match client.inbox.recv_timeout(Duration::from_millis(250)) {
+                Ok(ServerEvent::SetupComplete) => client.send_text_turn("Hello. What should I call you? Also, should we schedule a meeting to plan the meeting about reducing meetings?").unwrap(),
+                Ok(ServerEvent::Audio(bytes)) => audio_bytes += bytes.len(),
+                Ok(ServerEvent::OutputTranscript(text)) => transcript.push_str(&text),
+                Ok(ServerEvent::TurnComplete) if audio_bytes > 0 && !transcript.is_empty() => break,
+                Ok(ServerEvent::Error(error)) => panic!("voice smoke: {error}"),
+                Ok(ServerEvent::Closed(reason)) => panic!("voice smoke closed: {reason}"),
+                _ => {}
+            }
+        }
+        client.close();
+        println!("MORRIS_VOICE audio_bytes={audio_bytes} transcript={transcript}");
+        assert!(audio_bytes > 6_400, "no meaningful audio returned");
+        assert!(
+            transcript.to_ascii_lowercase().contains("morris"),
+            "{transcript}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires GEMINI_API_KEY; checks spoken acknowledgment with tool results withheld"]
+    fn live_pending_generation_acknowledgment_smoke() {
+        let mut config = crate::config::Config::default();
+        config.voice_live.enabled = true;
+        config.voice_live.allow_cloud = true;
+        config.voice_live.html_prototypes = true;
+        config.voice_live.music = true;
+        config.voice_live.persona = "morris".into();
+        config.voice_live.voice_name =
+            std::env::var("MINUTES_TEST_VOICE").unwrap_or_else(|_| "Puck".into());
+        let names = std::sync::Arc::new(crate::voice_live::NameIndex::default());
+        let tools = crate::voice_live::ToolContext::new(config.clone(), names.clone());
+        let setup = SessionSetup {
+            model: config.voice_live.model.clone(),
+            thinking_level: config.voice_live.thinking_level.clone(),
+            api_key: crate::voice_live::api_key(&config).unwrap(),
+            system_instruction: crate::voice_live::system_prompt(&config, &names, false),
+            function_declarations: tools.declarations(),
+            language: config.voice_live.language.clone(),
+            voice_name: config.voice_live.voice_name.clone(),
+            manual_activity: true,
+            proactive_audio: false,
+            start_sensitivity: String::new(),
+            end_sensitivity: String::new(),
+            resume_handle: None,
+        };
+        let client = LiveClient::connect(&setup).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        let mut turn = 0;
+        let mut called = [false; 2];
+        let mut audio = [0usize; 2];
+        let mut transcript = [String::new(), String::new()];
+        let mut music_description = String::new();
+        let mut finished = false;
+        // Neither tool is executed or answered: the board stays pending while
+        // the second request must get its own audible acknowledgment.
+        while std::time::Instant::now() < deadline {
+            match client.inbox.recv_timeout(Duration::from_millis(250)) {
+                Ok(ServerEvent::SetupComplete) => client.send_text_turn(
+                    "Build a small interactive board with Now, Next and Later columns. Use these three cards: Fewer meetings, Smaller teams, Shorter workdays. Let me move the cards between columns. This is the complete brief; build it now."
+                ).unwrap(),
+                Ok(ServerEvent::Audio(bytes)) => audio[turn] += bytes.len(),
+                Ok(ServerEvent::OutputTranscript(text)) => transcript[turn].push_str(&text),
+                Ok(ServerEvent::ToolCall(calls)) => {
+                    for call in calls {
+                        assert_eq!(call.name, ["build_prototype", "make_music"][turn]);
+                        if call.name == "make_music" {
+                            music_description = call.args["description"].as_str().unwrap_or("").to_owned();
+                        }
+                        called[turn] = true;
+                    }
+                }
+                Ok(ServerEvent::TurnComplete) if called[turn] => {
+                    if turn == 0 {
+                        turn = 1;
+                        client.send_text_turn("While I'm waiting for that, can you create hold music for me?").unwrap();
+                    } else {
+                        finished = true;
+                        break;
+                    }
+                }
+                Ok(ServerEvent::Error(error)) => panic!("acknowledgment smoke: {error}"),
+                Ok(ServerEvent::Closed(reason)) => panic!("acknowledgment smoke closed: {reason}"),
+                _ => {}
+            }
+        }
+        client.close();
+        println!(
+            "GENERATION_ACK voice={} called={called:?} audio={audio:?} transcripts={transcript:?} music_description={music_description}",
+            config.voice_live.voice_name
+        );
+        assert!(finished && called.iter().all(|called| *called));
+        assert!(
+            audio.iter().all(|bytes| *bytes > 6_400),
+            "missing spoken acknowledgment"
+        );
+        assert!(transcript.iter().all(|text| !text.trim().is_empty()));
+        let description = music_description.to_ascii_lowercase();
+        assert!(
+            ["snark", "sarcas", "witt", "dry", "deadpan"]
+                .iter()
+                .any(|word| description.contains(word)),
+            "hold-music default missing: {music_description}"
+        );
+    }
+
+    #[test]
     #[ignore = "requires GEMINI_API_KEY; synthetic routing only, no prototypes generated"]
     fn live_prototype_routing_smoke() {
         let mut config = crate::config::Config::default();
@@ -949,6 +1116,7 @@ mod tests {
                 api_key: crate::voice_live::api_key(&config).unwrap(),
                 system_instruction: crate::voice_live::system_prompt(&config, &names, false),
                 function_declarations: tools.declarations(), language: "en-US".into(),
+                voice_name: config.voice_live.voice_name.clone(),
                 manual_activity: true, proactive_audio: false, start_sensitivity: String::new(),
                 end_sensitivity: String::new(), resume_handle: None,
             };

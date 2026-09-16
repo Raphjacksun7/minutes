@@ -93,6 +93,14 @@ is not a guarantee of comprehensive redaction.
 
 ## Small HTML prototypes
 
+The Live voice can be selected with `[voice_live] voice_name = "Charon"` (or
+another supported Gemini voice). Empty preserves the provider default. Optional
+`persona = "morris"` adds a dry, helpful chief-of-staff tone without changing tool,
+privacy or approval rules. Both settings take effect in a new session; a resumed
+socket retains the selected voice. Other users keep the existing tone by default.
+Morris gives useful facts first; humor must not invent urgency or contradict the
+answer. Voice selection changes the sound, independently of the persona.
+
 `[voice_live] html_prototypes = true` opts into a bounded discuss/build/revise
 loop. It is off by default and also requires voice cloud consent. Gemini Live
 distills an explicit build request into a brief; the configured coding agent
@@ -100,6 +108,12 @@ distills an explicit build request into a brief; the configured coding agent
 The agent uses the isolated Recall launch contract, not broad `ask_agent`
 permissions or configured permission-bypass flags. Merely discussing an idea
 must not start a build. This is intent routing, not speaker identification.
+
+New prototypes without a requested visual style default to a restrained lo-fi
+cyberpunk developer-tool direction: charcoal, readable monospace, crisp borders,
+pixel details and selective bright accents. An explicit user style overrides
+that default. Revisions preserve their existing look unless a change is requested.
+This is generation guidance, not a deterministic theme applied to arbitrary HTML.
 
 Minutes saves immutable versions under `~/.minutes/prototypes/` and opens a
 host-authored local viewer. Generated code runs in an opaque-origin iframe;
@@ -159,6 +173,23 @@ With music explicitly enabled, requested `make_music` calls generate and play
 directly without an additional terminal approval. The recording exclusion and
 post-generation recording check remain. The assistant must describe a pending
 call as generating, never as already drafted or playing.
+The prompt requires a brief spoken acknowledgment for each new generation
+request before calling its tool, including music requested while a build is
+pending. This is model behavior, not a deterministic host-generated audio cue.
+Unstyled hold-music requests default to dry, snarky lyrics over an upbeat,
+repetitive synth/lounge loop. Explicit style, instrumental, calm or no-jokes
+requests override that default; other music requests do not inherit it.
+
+Generated songs have a separate sample queue in both audio backends. Assistant
+speech takes priority; music resumes after a 250 ms speech tail. `control_music`
+routes directly to this session's generated-song queue before desktop dispatch:
+pause retains its position, play resumes, and stop discards the remaining audio
+without deleting the saved song or cutting off speech. These local controls do
+not wait behind corpus work and remain declared with music enabled even when
+desktop automation is disabled. Playlist skipping is not supported for generated
+songs. `/cancel` stops generated playback as well as cancelling queued calls.
+The Music/Spotify fallback compiles only a fixed command for its resolved target
+application, avoiding dictionary-specific verbs in a dynamic AppleScript tell.
 
 Each provider call is registered once. Duplicate IDs and model use of the
 reserved `host:` namespace are rejected. Cancellation before execution prevents
