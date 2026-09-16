@@ -209,6 +209,8 @@ pub mod transcription_coordinator;
 pub mod vault;
 pub mod vocabulary;
 pub mod voice;
+#[cfg(feature = "voice-live")]
+pub mod voice_live;
 pub mod watch;
 
 // Streaming audio API (for Prompter and other real-time consumers)
