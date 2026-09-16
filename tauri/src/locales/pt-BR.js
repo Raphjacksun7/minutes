@@ -447,7 +447,6 @@ window.__MINUTES_I18N['pt-BR'] = {
     "Local First": "Local em primeiro lugar",
     "Desktop app": "App de desktop",
     "Created by Mat Silverstein": "Criado por Mat Silverstein",
-    "Have questions about this ": "Tem dúvidas sobre este ",
 
     // ── Status / misc transient ─────────────────────────────────────
     "Loading...": "Carregando...",
@@ -489,6 +488,159 @@ window.__MINUTES_I18N['pt-BR'] = {
     "Restarting...": "Reiniciando...",
     "Saving...": "Salvando...",
     "Retrying": "Tentando de novo",
+
+    // ── Coach: apresentação e onboarding ──
+    "MEET COACH": "CONHEÇA O COACH",
+    "COACH": "COACH",
+    "A private second set of ears.": "Um segundo par de ouvidos, só seu.",
+    "A quiet nudge, right when it helps.": "Um empurrãozinho discreto, na hora certa.",
+    "Private live coaching during meetings. Coach listens alongside your recording and never controls it.": "Orientação ao vivo e privada durante as reuniões. O Coach escuta junto com a sua gravação e nunca interfere nela.",
+    "Coach follows the live conversation and offers short, timely suggestions while you meet.": "O Coach acompanha a conversa ao vivo e oferece sugestões curtas, na hora certa, enquanto você se reúne.",
+    "How it works": "Como funciona",
+    "What to capture": "O que capturar",
+    "When recording starts": "Quando a gravação começa",
+    "Your recording is always separate": "Sua gravação é sempre separada",
+    "Turn Coach off at any time. It never stops, pauses, or changes your recording.": "Desligue o Coach quando quiser. Ele nunca para, pausa nem altera sua gravação.",
+    "Meeting speech stays on this Mac.": "A fala da reunião não sai deste Mac.",
+    "Private on your screen": "Privado na sua tela",
+    "Coach uses Minutes’ screen-share protection, which is on by default, so its guidance stays out of your shared screen.": "O Coach usa a proteção de compartilhamento de tela do Minutes, ligada por padrão, então as orientações dele ficam fora da tela que você compartilha.",
+    "One quick setup": "Uma configuração rápida",
+    "Coach needs a small on-device AI model to run privately on your Mac.": "O Coach precisa de um modelo de IA pequeno, rodando no dispositivo, para funcionar de forma privada no seu Mac.",
+    "Ready in about 30 seconds": "Pronto em cerca de 30 segundos",
+    "Set up a small on-device model for private coaching.": "Configure um modelo pequeno no dispositivo para orientação privada.",
+    "Set up on-device": "Configurar no dispositivo",
+    "On-device (private, recommended)": "No dispositivo (privado, recomendado)",
+    "Download it yourself": "Baixar por conta própria",
+    "Use cloud": "Usar a nuvem",
+    "Uses the connection you already configured.": "Usa a conexão que você já configurou.",
+    "Not now": "Agora não",
+    "Start it your way": "Comece do seu jeito",
+
+    // ── Coach: configurações ──
+    "Turn live meeting guidance on or off.": "Liga e desliga a orientação ao vivo nas reuniões.",
+    "Open Coach settings": "Abrir configurações do Coach",
+    "Start Coach automatically when I record": "Iniciar o Coach automaticamente quando eu gravar",
+    "Ask each meeting": "Perguntar a cada reunião",
+    "Off keeps manual starts available.": "Desligado mantém o início manual disponível.",
+    "Start Coach with every recording, ask each meeting, or keep it off until you choose it.": "Inicie o Coach em toda gravação, pergunte a cada reunião, ou mantenha desligado até você escolher.",
+    "Only alert me when it matters": "Só me avisar quando importar",
+    "Keep routine suggestions quiet; show critical coaching alerts.": "Mantém as sugestões de rotina em silêncio e mostra apenas os alertas críticos de orientação.",
+    "Critical Coach alerts when the HUD is hidden": "Alertas críticos do Coach quando o HUD está escondido",
+    "Provider and model details will appear here.": "Os detalhes de provedor e modelo aparecem aqui.",
+    "Technical Details": "Detalhes técnicos",
+    "AI model": "Modelo de IA",
+    "Cloud": "Nuvem",
+
+    // ── Transcrição: motores e disponibilidade ──
+    "Auto (Whisper)": "Automático (Whisper)",
+    "Apple Speech — unavailable, using Whisper": "Apple Speech: indisponível, usando o Whisper",
+    "Parakeet — unavailable": "Parakeet: indisponível",
+    "Parakeet cannot currently receive Minutes' secure private audio; retained preferences resolve to Whisper.": "No momento o Parakeet não consegue receber o áudio privado e seguro do Minutes; as preferências guardadas caem para o Whisper.",
+    "The main engine controls batch, recording, and recording-sidecar transcription. Standalone live transcript has its own backend setting above.": "O motor principal controla a transcrição em lote, de gravação e do sidecar de gravação. A transcrição ao vivo independente tem o próprio backend na opção acima.",
+
+    // ── Chat / terminal do assistente ──
+    "Chat is the simpler experience. Terminal keeps the assistant's full controls for power users.": "O chat é a experiência mais simples. O Terminal mantém os controles completos do assistente para usuários avançados.",
+    "Switch to Terminal": "Mudar para o Terminal",
+    "Use Terminal instead": "Usar o Terminal",
+    "Ask about this meeting…": "Pergunte sobre esta reunião…",
+    "Jump to latest message": "Ir para a última mensagem",
+    "↓ new messages": "↓ novas mensagens",
+    "Send": "Enviar",
+    "History": "Histórico",
+    "Phase: Recall": "Fase: Recall",
+
+    // ── Listas, documentos e ações ──
+    "Loading meetings…": "Carregando reuniões…",
+    "Expand list pane": "Expandir painel da lista",
+    "Close document": "Fechar documento",
+    "Open": "Abrir",
+    "Open Settings": "Abrir Configurações",
+    "Reprocess": "Reprocessar",
+    "Resummarize": "Resumir de novo",
+    "Retry": "Tentar de novo",
+    "Dismiss": "Dispensar",
+    "Listening…": "Ouvindo…",
+
+    // ── Ditado e prompt de reunião ──
+    "Select dictation microphone": "Selecionar microfone do ditado",
+    "Used only for dictation started inside Minutes. Shortcut gestures finish shortcut dictation.": "Usado apenas para ditados iniciados dentro do Minutes. Os gestos de atalho encerram o ditado por atalho.",
+    "Meeting goal": "Objetivo da reunião",
+    "What do you want out of this meeting?": "O que você quer tirar desta reunião?",
+    "(optional)": "(opcional)",
+
+    // ── Placeholders de exemplo ──
+    "e.g. Mat Silverstein": "ex.: Mat Silverstein",
+    "e.g. Mathieu, Matt, Matthew": "ex.: Mathieu, Matt, Matthew",
+    "e.g. Agree on the next step": "ex.: Combinar o próximo passo",
+    "e.g. --model sonnet": "ex.: --model sonnet",
+    "e.g. 1password, Messages": "ex.: 1password, Mensagens",
+    "e.g. zoom.us, Arc, Safari": "ex.: zoom.us, Arc, Safari",
+    "you@work.com, you@personal.com": "voce@trabalho.com, voce@pessoal.com",
+
+    // ── Dicas da paleta de comandos ──
+    "navigate": "navegar",
+    "run": "executar",
+    "or": "ou",
+
+    // ── Estados transitórios da UI ──
+    "Checking…": "Verificando…",
+    "Checking now…": "Verificando agora…",
+    "Checking for recovery items in the background...": "Procurando itens de recuperação em segundo plano...",
+    "Reading…": "Lendo…",
+    "Opening…": "Abrindo…",
+    "Saving…": "Salvando…",
+    "Setting up…": "Configurando…",
+    "Resummarizing…": "Resumindo de novo…",
+    "Starting": "Iniciando",
+    "Queued for processing": "Na fila para processamento",
+    "Meeting saved, processing in background": "Reunião salva, processando em segundo plano",
+    "Waiting for another Minutes task to finish…": "Aguardando outra tarefa do Minutes terminar…",
+    "On-device model ready": "Modelo no dispositivo pronto",
+    "Read-only": "Somente leitura",
+    "Recheck": "Verificar de novo",
+    "Confirm?": "Confirmar?",
+    "Dismiss notice": "Dispensar aviso",
+
+    // ── Ditado: disponibilidade do "Digitar no cursor" ──
+    "Set up Type at cursor": "Configurar o Digitar no cursor",
+    "Type at cursor — unavailable here": "Digitar no cursor: indisponível aqui",
+    "Type at cursor — unavailable here; copies instead": "Digitar no cursor: indisponível aqui; copia em vez disso",
+    "Active-app insertion is unavailable in this session. Choose clipboard delivery so your transcript remains accessible.": "A inserção no app ativo está indisponível nesta sessão. Escolha a entrega pela área de transferência para que sua transcrição continue acessível.",
+    "Minutes inserts into the active app and keeps the final transcript on your clipboard. Terminal prompts use the reliable paste path; if direct typing cannot be verified, the transcript stays safely copied.": "O Minutes insere no app ativo e mantém a transcrição final na área de transferência. Prompts de terminal usam o caminho confiável de colagem; se a digitação direta não puder ser verificada, a transcrição fica copiada em segurança.",
+    "This platform supports clipboard delivery, not verified active-app insertion. Minutes will preserve the transcript on the clipboard.": "Esta plataforma suporta entrega pela área de transferência, não a inserção verificada no app ativo. O Minutes preserva a transcrição na área de transferência.",
+    "On X11, Minutes uses the clipboard and xdotool after verifying the target. If insertion is unavailable, your transcript stays on the clipboard.": "No X11, o Minutes usa a área de transferência e o xdotool depois de verificar o destino. Se a inserção não estiver disponível, sua transcrição fica na área de transferência.",
+    "Four separate capabilities, checked only for dictation. Minutes never asks recording-only users to configure them.": "Quatro capacidades separadas, verificadas apenas para o ditado. O Minutes nunca pede que quem só grava configure isso.",
+
+    // ── Recuperação e assistente ──
+    "Finish copying the file, then restart the folder watcher. Recovery Center will not process a watch-root file independently.": "Termine de copiar o arquivo e reinicie o monitor de pasta. A Central de recuperação não processa sozinha um arquivo na raiz monitorada.",
+    "Ask me about this meeting — action items, decisions, key moments from the transcript. I have access to your meeting workspace.": "Me pergunte sobre esta reunião: itens de ação, decisões, momentos-chave da transcrição. Tenho acesso ao workspace da sua reunião.",
+
+    // ── Rodapé contextual (concatenado com o tipo de conteúdo) ──
+    "Have questions about this meeting?": "Tem dúvidas sobre esta reunião?",
+    "Have questions about this memo?": "Tem dúvidas sobre este memo?",
+    "Have questions about this note?": "Tem dúvidas sobre esta nota?",
+    "Have questions about this dictation?": "Tem dúvidas sobre este ditado?",
+
+    // ── Ditado: overlay de status e recuperação ──
+    "Downloading…": "Baixando…",
+    "Reprocessing…": "Reprocessando…",
+    "Recovering dictation": "Recuperando ditado",
+    "Dictation model not installed": "Modelo de ditado não instalado",
+    "Model download failed": "Falha ao baixar o modelo",
+    "Model ready — press fn to dictate": "Modelo pronto: pressione fn para ditar",
+    "Microphone unavailable": "Microfone indisponível",
+    "Audio is still safe": "O áudio continua seguro",
+    "Try Again": "Tentar de novo",
+    "Try again": "Tentar de novo",
+
+    // ── Ditado: permissão de Acessibilidade ──
+    "Fix typing": "Corrigir a digitação",
+    "Check Minutes in Accessibility": "Verifique o Minutes em Acessibilidade",
+    "Could not open Accessibility settings": "Não foi possível abrir os ajustes de Acessibilidade",
+    "Copied · Accessibility off": "Copiado · Acessibilidade desligada",
+
+    // ── Paleta de comandos ──
+    "press Enter to run": "pressione Enter para executar",
 
     // ── Transcription language dropdown ─────────────────────────────
     "Afrikaans": "Africâner",
@@ -608,6 +760,9 @@ window.__MINUTES_I18N['pt-BR'] = {
     { re: "^Desktop app v(.+)$", to: "App de desktop v$1" },
     { re: "^Downloading (.+) model\\.\\.\\.$", to: "Baixando o modelo $1..." },
     { re: "^Queued (\\d+)$", to: "$1 na fila" },
-    { re: "^(.+) call detected$", to: "Chamada do $1 detectada" }
+    { re: "^(.+) call detected$", to: "Chamada do $1 detectada" },
+    { re: "^Phase: (.+)$", to: "Fase: $1" },
+    { re: "^Using: (.+) \u2014 no API key needed, uses your existing subscription$", to: "Usando: $1, sem precisar de chave de API, usa sua assinatura atual" },
+    { re: "^Meetings: (.+) \\((\\d+) files\\) • Memos: (.+) \\((\\d+)\\) • Models: (.+) • Screenshots: (.+) • Total: (.+)$", to: "Reuniões: $1 ($2 arquivos) • Memos: $3 ($4) • Modelos: $5 • Capturas de tela: $6 • Total: $7" }
   ]
 };
