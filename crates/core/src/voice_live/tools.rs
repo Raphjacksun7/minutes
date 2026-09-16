@@ -179,6 +179,9 @@ impl ToolContext {
                 json!({"within_minutes": {"type": "integer", "description": "Look-ahead window in minutes (default 720)"}}),
             ));
         }
+        if self.config.voice_live.html_prototypes {
+            d.push(decl("build_prototype", "Build or revise a small, self-contained interactive HTML prototype only when the user explicitly asks. Pass a complete brief distilled from the conversation. Runs the selected coding agent in isolation, saves a new version, and opens a restricted local preview. No terminal approval needed for this opt-in scope. Cannot edit repositories, install packages or access services. For a revision pass the exact previous prototype_id as previous_id; never invent one.", json!({"brief":{"type":"string"},"previous_id":{"type":"string"},"agent":{"type":"string","enum":["default","codex","claude"]}})));
+        }
         if self.config.voice_live.ask_agent {
             d.push(decl(
                 "read_pull_requests",
@@ -520,6 +523,7 @@ impl ToolContext {
             }
             "think_deeply" => super::reasoning::think(cfg, args),
             "research_public" => super::research::research(cfg, args),
+            "build_prototype" => super::prototype::build(cfg, args),
             "list_meetings" => {
                 let limit = int_arg(args, "limit", 10).clamp(1, 50);
                 let filters = SearchFilters {
@@ -791,10 +795,7 @@ impl ToolContext {
 fn requires_host_review(name: &str, connected: bool) -> bool {
     connected
         || desktop::find(name).is_some_and(|v| v.risk == desktop::Risk::Outward)
-        || matches!(
-            name,
-            "propose_checkpoint" | "add_note" | "ask_agent" | "make_music"
-        )
+        || matches!(name, "propose_checkpoint" | "add_note" | "ask_agent")
 }
 
 fn decl(name: &str, description: &str, properties: Value) -> Value {
@@ -805,6 +806,7 @@ fn decl(name: &str, description: &str, properties: Value) -> Value {
         "add_note" => vec!["text"],
         "ask_agent" => vec!["question"],
         "think_deeply" | "research_public" => vec!["question"],
+        "build_prototype" => vec!["brief"],
         "review_pull_request" => vec!["repository", "number"],
         _ => vec![],
     };
@@ -1366,6 +1368,7 @@ mod tests {
             "read_pull_requests",
             "review_pull_request",
             "research_public",
+            "make_music",
         ] {
             assert!(
                 !requires_host_review(name, false),
@@ -1378,7 +1381,6 @@ mod tests {
             "propose_checkpoint",
             "add_note",
             "ask_agent",
-            "make_music",
         ] {
             assert!(
                 requires_host_review(name, false),
@@ -1386,6 +1388,19 @@ mod tests {
             );
         }
         assert!(requires_host_review("hubspot__search", true));
+    }
+
+    #[test]
+    fn enabled_music_does_not_stage_approval_before_validating_its_brief() {
+        let mut config = Config::default();
+        config.voice_live.music = true;
+        let ctx = ToolContext::new(config, Arc::new(NameIndex::default()));
+        let out = ctx.execute("make_music", &json!({}));
+        assert!(out.is_error);
+        assert!(!out.text.contains("local host review"));
+        assert!(ctx.continuity.lock().unwrap().review().is_none());
+        assert!(!requires_host_review("make_music", false));
+        assert!(requires_host_review("ask_agent", false));
     }
 
     #[test]
@@ -1415,6 +1430,28 @@ mod tests {
             .find(|d| d["name"] == "research_public")
             .unwrap();
         assert_eq!(declaration["parameters"]["required"], json!(["question"]));
+    }
+
+    #[test]
+    fn prototype_generation_has_its_own_opt_in_and_never_stages_broad_approval() {
+        let ctx = ToolContext::new(Config::default(), Arc::new(NameIndex::default()));
+        assert!(!ctx
+            .declarations()
+            .iter()
+            .any(|d| d["name"] == "build_prototype"));
+        let result = ctx.execute("build_prototype", &json!({"brief":"demo"}));
+        assert!(result.is_error);
+        assert!(result.text.contains("disabled"));
+        assert!(ctx.continuity.lock().unwrap().review().is_none());
+        let mut config = Config::default();
+        config.voice_live.html_prototypes = true;
+        let ctx = ToolContext::new(config, Arc::new(NameIndex::default()));
+        assert!(ctx
+            .declarations()
+            .iter()
+            .any(|d| d["name"] == "build_prototype"));
+        assert!(!requires_host_review("build_prototype", false));
+        assert!(requires_host_review("ask_agent", false));
     }
 
     #[test]
