@@ -76,9 +76,13 @@ pub(super) fn execute(
         "read_clipboard_text" if voice.clipboard => &[][..],
         "copy_text" if voice.clipboard => &["text"][..],
         "read_selected_text" if voice.text_input => &["target_app"][..],
-        "paste_text" if voice.text_input => {
-            &["target_app", "text", "mode", "expected_selection"][..]
-        }
+        "paste_text" if voice.text_input => &[
+            "target_app",
+            "text",
+            "mode",
+            "expected_selection",
+            "selection_id",
+        ][..],
         _ => return Err("That text capability is disabled; nothing read or changed.".into()),
     };
     let object = args
@@ -96,14 +100,20 @@ pub(super) fn execute(
     match name {
         "read_clipboard_text" => clipboard_read(),
         "copy_text" => clipboard_write(field("text")?),
-        "read_selected_text" => super::selection::capture(Some(field("target_app")?)),
+        "read_selected_text" => super::selection::capture(Some(field("target_app")?)).map_err(|error| {
+            let code=if error.starts_with("No selected text") { "selection_not_exposed" }
+                else if error.contains("Accessibility permission") { "selection_permission_required" }
+                else if error.contains("Secure fields") { "selection_secure_field" }
+                else { "selection_unavailable" };
+            format!("{code}: {error} No whole-document or clipboard fallback was performed. Do not infer a specific app defect from this failure. Offer explicit clipboard sharing or ask for a supported editable selection; do not retry unchanged.")
+        }),
         "paste_text" => {
             let mode = args
                 .get("mode")
                 .map(|m| m.as_str().unwrap_or(""))
                 .unwrap_or("insert");
             let expected = match mode {
-                "insert" if !object.contains_key("expected_selection") => None,
+                "insert" if !object.contains_key("expected_selection") && !object.contains_key("selection_id") => None,
                 "replace_selection" => Some(field("expected_selection")?),
                 _ => return Err("Use insert without expected_selection, or replace_selection with the exact previously read selection.".into()),
             };
@@ -111,6 +121,11 @@ pub(super) fn execute(
                 field("target_app")?,
                 field("text")?,
                 expected,
+                if expected.is_some() {
+                    Some(field("selection_id")?)
+                } else {
+                    None
+                },
                 &voice.text_input_apps,
             )
         }

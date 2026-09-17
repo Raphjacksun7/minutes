@@ -1143,12 +1143,16 @@ pub struct VoiceLiveConfig {
     pub known_people: usize,
     /// Expose knowledge-base search/read when `[knowledge].path` is set.
     pub brain_search: bool,
+    /// Explicit opt-in to request-scoped Jev evaluation of bounded observed snippets/labels.
+    pub jev_evaluation: bool,
     /// Expose a single on-request screen frame (phase 3).
     pub screen_on_request: bool,
     /// Explicit clipboard reads and copies, not continuous monitoring.
     pub clipboard: bool,
     /// Named-app selected-text reads and guarded text insertion.
     pub text_input: bool,
+    /// Save and resume voice-created work history on explicit spoken request.
+    pub work_memory: bool,
     /// Exact bundle identifiers allowed to receive text. Never shell/agent consoles.
     pub text_input_apps: Vec<String>,
     /// Write a markdown transcript of each session to ~/.minutes/voice-sessions/.
@@ -1260,9 +1264,11 @@ impl Default for VoiceLiveConfig {
             max_tool_chars: 12_000,
             known_people: 200,
             brain_search: true,
+            jev_evaluation: false,
             screen_on_request: false,
             clipboard: false,
             text_input: false,
+            work_memory: false,
             text_input_apps: [
                 "com.apple.TextEdit",
                 "com.apple.Notes",

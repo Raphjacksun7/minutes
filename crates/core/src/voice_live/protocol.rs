@@ -245,6 +245,26 @@ impl LiveClient {
         self.send_json(client_image_json(bytes, mime, caption))
     }
 
+    /// Bind the image to its function response instead of racing two turns.
+    pub fn send_screen_result(
+        &self,
+        call: &FunctionCall,
+        result: &str,
+        bytes: &[u8],
+        caption: &str,
+    ) -> Result<(), VoiceLiveError> {
+        let mut receipt = completed_tool_result(call, result);
+        receipt["screen"] = json!({"$ref":"screen.png"});
+        receipt["caption"] = json!(caption);
+        let mut response = self
+            .profile
+            .function_response(&call.id, &call.name, receipt, "WHEN_IDLE")
+            .map_err(VoiceLiveError::Connect)?;
+        response["parts"] = json!([{"inlineData":{"mimeType":"image/png","data":B64.encode(bytes),"displayName":"screen.png"}}]);
+        response["willContinue"] = json!(false);
+        self.send_json(json!({"toolResponse":{"functionResponses":[response]}}))
+    }
+
     /// Manual voice activity markers (push-to-talk mode only).
     pub fn activity_start(&self) -> Result<(), VoiceLiveError> {
         self.send_json(json!({ "realtimeInput": { "activityStart": {} } }))
@@ -263,6 +283,14 @@ impl LiveClient {
         }}))
     }
 
+    /// Add host state without starting a new user turn or interrupting speech.
+    pub fn send_context_update(&self, text: &str) -> Result<(), VoiceLiveError> {
+        self.send_json(json!({ "clientContent": {
+            "turns": [{ "role": "user", "parts": [{ "text": text }] }],
+            "turnComplete": false,
+        }}))
+    }
+
     /// Answer a tool call. `scheduling` is WHEN_IDLE, INTERRUPT, or SILENT.
     pub fn send_tool_response(
         &self,
@@ -270,11 +298,24 @@ impl LiveClient {
         result: &str,
         scheduling: &str,
     ) -> Result<(), VoiceLiveError> {
-        let response = self
+        let mut response = self
             .profile
-            .function_response(&call.id, &call.name, json!(result), scheduling)
+            .function_response(
+                &call.id,
+                &call.name,
+                completed_tool_result(call, result),
+                scheduling,
+            )
             .map_err(VoiceLiveError::Connect)?;
+        response["willContinue"] = json!(false);
         self.send_json(json!({ "toolResponse": { "functionResponses": [response] }}))
+    }
+
+    /// A truthful partial receipt keeps a long NON_BLOCKING call open.
+    pub fn send_tool_progress(&self, call: &FunctionCall) -> Result<(), VoiceLiveError> {
+        let mut response=self.profile.function_response(&call.id,&call.name,json!({"job_id":call.id,"state":"running","completed":false,"note":"The independent worker is running. No artifact or implementation phase is known yet. Other tools may run concurrently. This is not a completion receipt."}),"SILENT").map_err(VoiceLiveError::Connect)?;
+        response["willContinue"] = json!(true);
+        self.send_json(json!({"toolResponse":{"functionResponses":[response]}}))
     }
 
     /// Ask the IO thread to close the socket and wait for it.
@@ -532,6 +573,22 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
 /// tool call without it and only saw the frame on the following turn. Waiting
 /// longer did not help, because the frame was not part of the turn being
 /// generated at all.
+pub(super) fn completed_tool_result(call: &FunctionCall, result: &str) -> Value {
+    let result = serde_json::from_str::<Value>(result).unwrap_or_else(|_| json!({"text": result}));
+    let state = if result.get("error").is_some() {
+        "Failed"
+    } else if result.get("proposal_id").is_some() || result["needs_confirmation"] == true {
+        "AwaitingApproval"
+    } else if result["cancelled"] == true || result["state"] == "Cancelled" {
+        "Cancelled"
+    } else if result["state"] == "FinishedAfterCancellation" {
+        "FinishedAfterCancellation"
+    } else {
+        "Completed"
+    };
+    json!({"job_id":call.id,"tool":call.name,"state":state,"finished":true,"completion_scope":"This is the final tool receipt and supersedes all earlier running notices for this job. Do not describe completed work as still running. A proposal is not execution; AwaitingApproval means no action occurred. Independent work does not block other requests. Consult get_status if current state is uncertain.","result":result})
+}
+
 fn client_image_json(bytes: &[u8], mime: &str, caption: &str) -> Value {
     json!({ "clientContent": {
         "turns": [{ "role": "user", "parts": [
@@ -562,6 +619,200 @@ fn redact_key(message: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_receipt_is_structured_and_overrides_running_state() {
+        let call = FunctionCall {
+            id: "job-1".into(),
+            name: "build_prototype".into(),
+            args: json!({}),
+        };
+        let receipt = completed_tool_result(&call, r#"{"prototype_id":"a","opened":true}"#);
+        assert_eq!(receipt["state"], "Completed");
+        assert_eq!(receipt["finished"], true);
+        assert_eq!(receipt["result"]["opened"], true);
+        assert_eq!(
+            completed_tool_result(&call, r#"{"error":"agent_timeout: timed out"}"#)["state"],
+            "Failed"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires GEMINI_API_KEY; synthetic native Live control and completion routing"]
+    fn live_control_and_completion_routing() {
+        let mut config = crate::config::Config::default();
+        config.voice_live.enabled = true;
+        config.voice_live.allow_cloud = true;
+        config.voice_live.html_prototypes = true;
+        config.voice_live.model = "gemini-3.8-live-extended-thinking".into();
+        config.voice_live.voice_name = "Zephyr".into();
+        let names = std::sync::Arc::new(crate::voice_live::NameIndex::default());
+        let tools = crate::voice_live::ToolContext::new(config.clone(), names.clone());
+        let setup = SessionSetup {
+            model: config.voice_live.model.clone(),
+            thinking_level: config.voice_live.thinking_level.clone(),
+            api_key: crate::voice_live::api_key(&config).unwrap(),
+            system_instruction: crate::voice_live::system_prompt(&config, &names, false),
+            function_declarations: tools.declarations(),
+            language: "en-US".into(),
+            voice_name: "Zephyr".into(),
+            manual_activity: true,
+            proactive_audio: false,
+            start_sensitivity: String::new(),
+            end_sensitivity: String::new(),
+            resume_handle: None,
+        };
+        let client = LiveClient::connect(&setup).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        let mut phase = 0;
+        let mut status_read = false;
+        let mut recovered = false;
+        let mut speech = String::new();
+        while std::time::Instant::now() < deadline {
+            match client.inbox.recv_timeout(Duration::from_millis(100)) {
+                Ok(ServerEvent::SetupComplete)=>client.send_text_turn("Build a small interactive revenue simulator with a revenue slider. Please build it now.").unwrap(),
+                Ok(ServerEvent::ToolCall(calls))=>for call in calls {
+                    let result=match call.name.as_str() {
+                        "build_prototype" if phase==0=> { client.send_tool_progress(&call).unwrap(); phase=1;json!({"prototype_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","opened":true,"live_controls":true,"title":"Revenue simulator","generated":true,"tested":false}) },
+                        "list_prototypes" => json!({"artifacts":[{"prototype_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","title":"Revenue simulator"}]}),
+                        "inspect_prototype" if phase==2 && !recovered=> { recovered=true;json!({"error":"artifact_reference_unknown: no matching preview; no command delivered","recovery":{"artifacts":[{"prototype_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","title":"Revenue simulator"}]},"next_step":"Inspect the exact prototype_id in recovery.artifacts. Do not rebuild or switch to app controls."}) },
+                        "inspect_prototype" if phase==2=> { assert_eq!(call.args["prototype_id"],"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");phase=3;json!({"prototype_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","snapshot_id":"fixture:1","controls":[{"control_id":"control-1","label":"Revenue","type":"range","value":"25","min":"0","max":"100","step":"5"}],"output":"50"}) },
+                        "set_prototype_control" if phase==3=> { assert_eq!(call.args["snapshot_id"],"fixture:1");assert_eq!(call.args["control_id"],"control-1");assert_eq!(call.args["value"],"75"); phase=4;json!({"changed":{"before":"25","after":"75"},"output":"150","snapshot_id":"fixture:2","undo_id":"change-1"}) },
+                        "get_status" if phase>=1=> { if phase>=4 {status_read=true;phase=6;} json!({"active_jobs":[],"active_job_count":0,"jobs":[{"tool":"build_prototype","state":"Completed","prototype_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","opened":true,"live_controls":true}],"note":"The prototype has finished and its live controls can be inspected now. No jobs are running."}) },
+                        other=>panic!("Unexpected tool {other} in phase {phase}; {speech}"),
+                    };
+                    client.send_tool_response(&call,&result.to_string(),"WHEN_IDLE").unwrap();
+                },
+                Ok(ServerEvent::OutputTranscript(t))=>speech.push_str(&t),
+                Ok(ServerEvent::TurnComplete) if phase==1=> { phase=2; client.send_text_turn("Set the Revenue slider in that prototype to 75, without rebuilding it.").unwrap(); },
+                Ok(ServerEvent::TurnComplete) if phase==4=> {phase=5;speech.clear();client.send_text_turn("What is still running? Is that prototype still building?").unwrap();},
+                Ok(ServerEvent::TurnComplete) if phase==6 && !speech.is_empty()=>break,
+                Ok(ServerEvent::Error(e)|ServerEvent::Closed(e))=>panic!("{e}"),
+                _=>{}
+            }
+        }
+        client.close();
+        assert!(
+            status_read,
+            "No current status read; phase={phase}; {speech}"
+        );
+        let lower = speech.to_lowercase();
+        assert!(
+            lower.contains("nothing")
+                || lower.contains("no tasks")
+                || lower.contains("finished")
+                || lower.contains("complete"),
+            "{speech}"
+        );
+        println!("Native Live control and completion routing passed: {speech}");
+    }
+
+    #[test]
+    #[ignore = "requires GEMINI_API_KEY; synthetic text-to-audio comparison, no microphone or private context"]
+    fn live_latency_comparison() {
+        for model in ["gemini-3.8-live", "gemini-3.8-live-extended-thinking"] {
+            for trial in 0..2 {
+                let mut config = crate::config::Config::default();
+                config.voice_live.enabled = true;
+                config.voice_live.allow_cloud = true;
+                config.voice_live.model = model.into();
+                config.voice_live.thinking_level = "low".into();
+                config.voice_live.voice_name = "Zephyr".into();
+                let names = crate::voice_live::NameIndex::default();
+                let setup = SessionSetup {
+                    model: model.into(),
+                    thinking_level: "low".into(),
+                    api_key: crate::voice_live::api_key(&config).unwrap(),
+                    system_instruction: crate::voice_live::system_prompt(&config, &names, false),
+                    function_declarations: vec![],
+                    language: "en-US".into(),
+                    voice_name: "Zephyr".into(),
+                    manual_activity: true,
+                    proactive_audio: false,
+                    start_sensitivity: String::new(),
+                    end_sensitivity: String::new(),
+                    resume_handle: None,
+                };
+                let client = LiveClient::connect(&setup).unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(40);
+                let mut sent = None;
+                let mut first_audio = None;
+                let mut speech = String::new();
+                while std::time::Instant::now() < deadline {
+                    match client.inbox.recv_timeout(Duration::from_millis(100)) {
+                        Ok(ServerEvent::SetupComplete) => {
+                            sent = Some(std::time::Instant::now());
+                            client
+                                .send_text_turn("What is six times seven? Just give the answer.")
+                                .unwrap();
+                        }
+                        Ok(ServerEvent::Audio(_)) if first_audio.is_none() => {
+                            first_audio = sent.map(|t| t.elapsed().as_millis());
+                        }
+                        Ok(ServerEvent::OutputTranscript(t)) => speech.push_str(&t),
+                        Ok(ServerEvent::TurnComplete) if first_audio.is_some() => break,
+                        Ok(ServerEvent::Error(e) | ServerEvent::Closed(e)) => {
+                            panic!("{model}: {e}")
+                        }
+                        _ => {}
+                    }
+                }
+                client.close();
+                println!(
+                    "LATENCY_SAMPLE={}",
+                    json!({"model":model,"trial":trial,"first_audio_ms":first_audio,"answer":speech,"scope":"synthetic text input, no mic/VAD/playback; two trials are not a benchmark"})
+                );
+                assert!(first_audio.is_some(), "No response audio for {model}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires GEMINI_API_KEY; synthetic room chatter and routing, no actions executed"]
+    fn live_room_chatter_and_note_routing() {
+        let mut cfg = crate::config::Config::default();
+        cfg.voice_live.enabled = true;
+        cfg.voice_live.allow_cloud = true;
+        cfg.voice_live.desktop_control = true;
+        cfg.voice_live.ask_agent = true;
+        cfg.voice_live.model = "gemini-3.8-live-extended-thinking".into();
+        cfg.voice_live.thinking_level = "low".into();
+        let names = std::sync::Arc::new(crate::voice_live::NameIndex::default());
+        let tools = crate::voice_live::ToolContext::new(cfg.clone(), names.clone());
+        for (request,expected) in [
+            ("I'm talking to my friend about this demo, not asking you to act: it can open Safari and write notes. No response needed.",None),
+            ("Create a new Apple Notes document titled Demo test containing The meeting about fewer meetings has been cancelled. Do that now.",Some("create_apple_note")),
+            ("Look for open pull requests waiting for MY review across all my repositories, not just Minutes.",Some("read_pull_requests"))
+        ] {
+            let setup=SessionSetup { model:cfg.voice_live.model.clone(),thinking_level:"low".into(),api_key:crate::voice_live::api_key(&cfg).unwrap(),system_instruction:crate::voice_live::system_prompt(&cfg,&names,false),function_declarations:tools.declarations(),language:"en-US".into(),voice_name:"Zephyr".into(),manual_activity:true,proactive_audio:false,start_sensitivity:String::new(),end_sensitivity:String::new(),resume_handle:None };
+            let client=LiveClient::connect(&setup).unwrap();
+            let mut sent=None;
+            let mut observed=false;
+            let mut spoken=String::new();
+            let deadline=std::time::Instant::now()+Duration::from_secs(35);
+            while std::time::Instant::now()<deadline {
+                match client.inbox.recv_timeout(Duration::from_millis(100)) {
+                    Ok(ServerEvent::SetupComplete)=>{client.send_text_turn(request).unwrap();sent=Some(std::time::Instant::now());},
+                    Ok(ServerEvent::ToolCall(calls))=>{
+                        for call in calls {
+                            assert_eq!(Some(call.name.as_str()),expected,"Unexpected action from synthetic request");
+                            if call.name=="read_pull_requests" {assert_eq!(call.args["review_requested"],true);assert!(call.args.get("repository").is_none());}
+                            if call.name=="create_apple_note" {assert_eq!(call.args["title"],"Demo test");}
+                            observed=true;
+                        }
+                        break;
+                    },
+                    Ok(ServerEvent::OutputTranscript(t))=>spoken.push_str(&t),
+                    Ok(ServerEvent::Error(e)|ServerEvent::Closed(e))=>panic!("{e}"),
+                    _=>{}
+                }
+                if expected.is_none() && sent.is_some_and(|t|t.elapsed()>Duration::from_secs(5)) {break;}
+            }
+            client.close();
+            assert_eq!(observed,expected.is_some(),"expected={expected:?}; speech={spoken}");
+            println!("DEMO_ROUTING={expected:?} passed; no actions executed");
+        }
+    }
 
     #[test]
     fn an_image_frame_is_an_ordered_turn_not_realtime_media() {
@@ -1017,8 +1268,9 @@ mod tests {
         config.voice_live.html_prototypes = true;
         config.voice_live.music = true;
         config.voice_live.persona = "morris".into();
+        config.voice_live.model = "gemini-3.8-live-extended-thinking".into();
         config.voice_live.voice_name =
-            std::env::var("MINUTES_TEST_VOICE").unwrap_or_else(|_| "Puck".into());
+            std::env::var("MINUTES_TEST_VOICE").unwrap_or_else(|_| "Kore".into());
         let names = std::sync::Arc::new(crate::voice_live::NameIndex::default());
         let tools = crate::voice_live::ToolContext::new(config.clone(), names.clone());
         let setup = SessionSetup {
@@ -1036,7 +1288,7 @@ mod tests {
             resume_handle: None,
         };
         let client = LiveClient::connect(&setup).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        let deadline = std::time::Instant::now() + Duration::from_secs(65);
         let mut turn = 0;
         let mut called = [false; 2];
         let mut audio = [0usize; 2];
@@ -1048,7 +1300,7 @@ mod tests {
         while std::time::Instant::now() < deadline {
             match client.inbox.recv_timeout(Duration::from_millis(250)) {
                 Ok(ServerEvent::SetupComplete) => client.send_text_turn(
-                    "Build a small interactive board with Now, Next and Later columns. Use these three cards: Fewer meetings, Smaller teams, Shorter workdays. Let me move the cards between columns. This is the complete brief; build it now."
+                    "Build a custom interactive calculator showing how team cost changes with hours saved each week. Include editable team size, hourly cost and hours saved, and a live chart. This is the complete brief; build it now."
                 ).unwrap(),
                 Ok(ServerEvent::Audio(bytes)) => audio[turn] += bytes.len(),
                 Ok(ServerEvent::OutputTranscript(text)) => transcript[turn].push_str(&text),
@@ -1059,6 +1311,9 @@ mod tests {
                             music_description = call.args["description"].as_str().unwrap_or("").to_owned();
                         }
                         called[turn] = true;
+                        if turn == 0 {
+                            client.send_tool_progress(&call).unwrap();
+                        }
                     }
                 }
                 Ok(ServerEvent::TurnComplete) if called[turn] => {
@@ -1073,6 +1328,13 @@ mod tests {
                 Ok(ServerEvent::Error(error)) => panic!("acknowledgment smoke: {error}"),
                 Ok(ServerEvent::Closed(reason)) => panic!("acknowledgment smoke closed: {reason}"),
                 _ => {}
+            }
+            if called.iter().all(|called| *called)
+                && audio.iter().all(|bytes| *bytes > 6_400)
+                && transcript.iter().all(|text| !text.trim().is_empty())
+            {
+                finished = true;
+                break;
             }
         }
         client.close();
@@ -1193,7 +1455,7 @@ mod tests {
                         for call in calls {
                             if call.name == "read_selected_text" {
                                 read_selection = true;
-                                client.send_tool_response(&call, r#"{"source":"host_selected_text","bundle_id":"com.apple.Notes","selected_text":"We should schedule fewer meetings to leave more time for focused work."}"#, "INTERRUPT").unwrap();
+                                client.send_tool_response(&call, r#"{"source":"host_selected_text","bundle_id":"com.apple.Notes","selection_id":"fixture-selection-1","selected_text":"We should schedule fewer meetings to leave more time for focused work."}"#, "INTERRUPT").unwrap();
                                 continue;
                             }
                             if call.name == "open_app" {
@@ -1207,6 +1469,7 @@ mod tests {
                                     assert!(read_selection);
                                     assert_eq!(call.args["mode"], "replace_selection");
                                     assert_eq!(call.args["expected_selection"], "We should schedule fewer meetings to leave more time for focused work.");
+                                    assert_eq!(call.args["selection_id"], "fixture-selection-1");
                                 } else {
                                     assert_eq!(call.args["text"], "A better way to work.");
                                 }
@@ -1236,6 +1499,7 @@ mod tests {
         config.voice_live.enabled = true;
         config.voice_live.allow_cloud = true;
         config.voice_live.screen_on_request = true;
+        config.voice_live.model = "gemini-3.8-live-extended-thinking".into();
         config.voice_live.persona = "morris".into();
         config.voice_live.voice_name = "Kore".into();
         let names = std::sync::Arc::new(crate::voice_live::NameIndex::default());
@@ -1257,19 +1521,11 @@ mod tests {
         let client = LiveClient::connect(&setup).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut captures = 0;
-        let mut image_due = None;
         let mut image_sent = false;
         let mut replies = [String::new(), String::new()];
         let mut phase = 0;
         let mut completed = false;
         while std::time::Instant::now() < deadline {
-            if image_due.is_some_and(|due| std::time::Instant::now() >= due) {
-                client
-                    .send_image(&image, "image/png", super::super::session::SCREEN_CAPTION)
-                    .unwrap();
-                image_due = None;
-                image_sent = true;
-            }
             match client.inbox.recv_timeout(Duration::from_millis(50)) {
                 Ok(ServerEvent::SetupComplete) => client
                     .send_text_turn("Can you tell what's going on in this message thread?")
@@ -1284,15 +1540,15 @@ mod tests {
                         captures += 1;
                         assert_eq!(captures, 1, "duplicate capture instead of waiting or interpreting existing evidence");
                         client
-                            .send_tool_response(
+                            .send_screen_result(
                                 &call,
                                 &json!({"note": super::super::tools::SCREEN_DELIVERY_NOTE})
                                     .to_string(),
-                                "SILENT",
+                                &image,
+                                super::super::session::SCREEN_CAPTION,
                             )
                             .unwrap();
-                        // Match the host's separate receipt/image ordering, including its delay.
-                        image_due = Some(std::time::Instant::now() + Duration::from_millis(800));
+                        image_sent = true;
                     }
                 }
                 Ok(ServerEvent::OutputTranscript(text)) => replies[phase].push_str(&text),
@@ -1462,6 +1718,60 @@ mod tests {
         client.close();
         assert_eq!(phase, 3, "incomplete research/open/recovery flow: {speech}");
         println!("SOURCE_RECOVERY: {speech}");
+    }
+
+    #[test]
+    #[ignore = "requires GEMINI_API_KEY; synthetic board routing, no browser or private data"]
+    fn live_decision_board_revision_smoke() {
+        let mut config = crate::config::Config::default();
+        config.voice_live.enabled = true;
+        config.voice_live.allow_cloud = true;
+        config.voice_live.html_prototypes = true;
+        config.voice_live.model = "gemini-3.8-live-extended-thinking".into();
+        config.voice_live.thinking_level = "low".into();
+        config.voice_live.voice_name = "Kore".into();
+        let names = std::sync::Arc::new(crate::voice_live::NameIndex::default());
+        let tools = crate::voice_live::ToolContext::new(config.clone(), names.clone());
+        let setup = SessionSetup {
+            model: config.voice_live.model.clone(),
+            thinking_level: "low".into(),
+            api_key: crate::voice_live::api_key(&config).unwrap(),
+            system_instruction: crate::voice_live::system_prompt(&config, &names, false),
+            function_declarations: tools.declarations(),
+            language: "en-US".into(),
+            voice_name: "Kore".into(),
+            manual_activity: true,
+            proactive_audio: true,
+            start_sensitivity: String::new(),
+            end_sensitivity: String::new(),
+            resume_handle: None,
+        };
+        let client = LiveClient::connect(&setup).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut phase = 0;
+        let mut asked = false;
+        let mut speech = String::new();
+        let board = |revision| json!({"board_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","revision":revision,"title":"Future work","columns":[{"id":"column-1","title":"Now","cards":[{"id":"card-4","title":"Fewer meetings","body":"Manual edit: protect focus"}]},{"id":"column-2","title":"Next","cards":[]},{"id":"column-3","title":"Later","cards":[]}],"selected_card_id":"card-4"});
+        while std::time::Instant::now() < deadline && phase < 3 {
+            match client.inbox.recv_timeout(Duration::from_millis(250)) {
+                Ok(ServerEvent::SetupComplete)=>client.send_text_turn("Create a Now Next Later decision board with one idea: Fewer meetings. Do it now.").unwrap(),
+                Ok(ServerEvent::OutputTranscript(text))=>speech.push_str(&text),
+                Ok(ServerEvent::ToolCall(calls))=>for call in calls {
+                    match phase {
+                        0=>{assert_eq!(call.name,"create_decision_board","{speech}");client.send_tool_response(&call,&board(1).to_string(),"SILENT").unwrap();phase=1;},
+                        1=>{assert_eq!(call.name,"read_decision_board","{speech}");client.send_tool_response(&call,&board(7).to_string(),"SILENT").unwrap();phase=2;},
+                        2=>{assert_eq!(call.name,"edit_decision_board","{speech}");assert_eq!(call.args["revision"],7);assert_eq!(call.args["board_id"],"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");assert_eq!(call.args["change"]["operation"],"move_card");assert_eq!(call.args["change"]["card_id"],"card-4");assert_eq!(call.args["change"]["column_id"],"column-2");phase=3;},
+                        _=>{}
+                    }
+                },
+                Ok(ServerEvent::TurnComplete) if phase==1&&!asked=>{asked=true;client.send_text_turn("I selected this card and made a manual edit. Move this one to Next; keep its current writing.").unwrap();},
+                Ok(ServerEvent::Error(e)|ServerEvent::Closed(e))=>panic!("{e}"),
+                _=>{}
+            }
+        }
+        client.close();
+        assert_eq!(phase, 3, "Board flow incomplete: {speech}");
+        println!("BOARD_ROUTING: create, read current revision, move selected exact card passed");
     }
 
     #[test]
