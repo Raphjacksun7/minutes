@@ -9,6 +9,10 @@ parakeet = ["minutes-core/parakeet", "minutes-core/whisper"]
 engine-sherpa = ["minutes-core/engine-sherpa"]
 pocketstation-capture = ["minutes-core/pocketstation-capture"]
 vad-ort = ["minutes-core/vad-ort"]
+# Voice Live: the spoken assistant (RFC 0007). Off by default because it pulls
+# native audio and websocket dependencies into a signed, notarized bundle.
+# Build with MINUTES_BUILD_FEATURES=parakeet,metal,voice-live to dogfood it.
+voice-live = ["minutes-core/voice-live"]
 coreml = ["minutes-core/coreml"]
 cuda = ["minutes-core/cuda"]
 hipblas = ["minutes-core/hipblas"]
@@ -31,7 +35,7 @@ dirs = "6"
 libc = "0.2"
 which = { workspace = true }
 portable-pty = "0.9"
-base64 = "0.22"
+base64 = "0.23"
 futures-util = "0.3"
 minisign-verify = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }

@@ -19,12 +19,18 @@ Capture, transcription, and storage run locally. If you choose a cloud AI assist
 
 ## Install
 
+Choose the desktop app or one standalone CLI installation. The desktop app
+includes a CLI: use **About Minutes → Set up CLI** to add it to your PATH.
+
 ```bash
-brew install --cask silverstein/tap/minutes
-brew install silverstein/tap/minutes
-cargo install minutes-cli
-npx minutes-mcp  # or: claude mcp add minutes -- npx -y minutes-mcp
+brew install --cask silverstein/tap/minutes  # Desktop app, with bundled CLI
+brew install silverstein/tap/minutes         # Standalone CLI alternative
+cargo install minutes-cli                   # Standalone CLI via Cargo
 ```
+
+For an agent connection, add the MCP server separately with
+`claude mcp add minutes -- npx -y minutes-mcp` (or run `npx minutes-mcp`
+from another MCP client).
 
 If Homebrew reports an untrusted tap, run `brew trust silverstein/tap` once.
 

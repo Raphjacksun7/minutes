@@ -12,6 +12,7 @@
   </script>
   <script src="scripts/ui-zoom.js"></script>
   <script src="locales/zh-CN.js"></script>
+  <script src="locales/pt-BR.js"></script>
   <script src="scripts/i18n.js"></script>
   <link rel="stylesheet" href="styles/ui-zoom-tokens.css">
   <style>
@@ -6448,6 +6449,7 @@
               <option value="auto">System default</option>
               <option value="en">English</option>
               <option value="zh-CN">简体中文</option>
+              <option value="pt-BR">Português (Brasil)</option>
             </select>
             <div class="about-controls-meta">Display language for the app, menus, and notifications.</div>
           </div>
@@ -10181,10 +10183,10 @@
       if (!button) return;
       liveTransitionButton = button;
       // Restore the canonical ENGLISH label, not whatever is currently rendered:
-      // under zh-CN the DOM holds the translated string, and writing that back
-      // creates a text node that is not a catalog key, so the localization
-      // observer can no longer map it and switching back to English would strand
-      // the button in Chinese.
+      // in a translated locale the DOM holds the translated string, and writing
+      // that back creates a text node that is not a catalog key, so the
+      // localization observer can no longer map it and switching back to English
+      // would strand the button in the other language.
       liveTransitionLabel = canonicalLabel || button.textContent;
       liveTransitionTarget = targetActive;
       button.disabled = true;
@@ -12296,7 +12298,7 @@
         setSettingsToggle('settings-notifications', notifyEnabled);
         copilotCriticalAlertsEnabled = s?.notifications?.copilot_critical_enabled === true;
         setSettingsToggle('settings-copilot-notifications', copilotCriticalAlertsEnabled);
-        // UI language — show the raw preference (auto/en/zh-CN), not the resolved locale.
+        // UI language — show the raw preference (auto/en/zh-CN/pt-BR), not the resolved locale.
         const uiLangSelect = document.getElementById('settings-ui-language');
         if (uiLangSelect && s?.ui?.language) uiLangSelect.value = s.ui.language;
         // Cues are localStorage-only (no config section).
@@ -13496,7 +13498,7 @@
       }
     });
     // UI language: persist via config + rebuild native shell, then apply to the
-    // frontend in place (cmd returns the resolved locale, "en" | "zh-CN").
+    // frontend in place (cmd returns the resolved locale, "en" | "zh-CN" | "pt-BR").
     document.getElementById('settings-ui-language').addEventListener('change', async (e) => {
       try {
         const resolved = await invoke('cmd_set_ui_language', { language: e.target.value });
@@ -14342,6 +14344,10 @@
     let recallReadiness = null;
     let recallSelectedMeetingPath = null;
     let pendingRecallTerminalMeetingPath = null;
+    // True while a Terminal session still owes its first real question the
+    // context it is allowed to see (the selected meeting, or the general
+    // meeting directory when none was selected). Cleared once materialized.
+    let recallTerminalContextPending = false;
     let recallTerminalInputDraft = '';
     let recallTerminalInputReliable = true;
     let recallTerminalInputQueue = Promise.resolve();
@@ -14438,6 +14444,7 @@
       recallModePreferenceExplicit = true;
       localStorage.setItem('minutes.recallModePreferenceExplicit', 'true');
       pendingRecallTerminalMeetingPath = recallDevMode ? recallSelectedMeetingPath : null;
+      recallTerminalContextPending = recallDevMode;
       recallTerminalInputDraft = '';
       recallTerminalInputReliable = true;
       syncRecallModeControls();
@@ -14479,6 +14486,7 @@
           'error'
         );
         pendingRecallTerminalMeetingPath = mode === 'meeting' ? meetingPath : null;
+        recallTerminalContextPending = true;
         recallTerminalInputDraft = '';
         recallTerminalInputReliable = true;
         return { mode: 'deferred', meetingPath: null };
@@ -14496,6 +14504,7 @@
 
       if (recallDevMode) {
         pendingRecallTerminalMeetingPath = mode === 'meeting' ? meetingPath : null;
+        recallTerminalContextPending = true;
         recallTerminalInputDraft = '';
         recallTerminalInputReliable = true;
         setRecallProviderNotice(
@@ -14506,6 +14515,7 @@
       }
 
       pendingRecallTerminalMeetingPath = null;
+      recallTerminalContextPending = false;
       setRecallProviderNotice(readiness.message);
       return { mode, meetingPath };
     }
@@ -14942,7 +14952,7 @@
         }
 
         const question = recallTerminalInputDraft.trim();
-        if (pendingRecallTerminalMeetingPath && (!question || !recallTerminalInputReliable)) {
+        if (recallTerminalContextPending && (!question || !recallTerminalInputReliable)) {
           setRecallProviderNotice(
             'For privacy, Minutes could not verify a complete question or command. Press Ctrl-U, retype it without cursor editing, and submit again. No meeting context was read.',
             'error'
@@ -14950,14 +14960,18 @@
           return;
         }
         const isAccountCommand = question.startsWith('/');
-        if (pendingRecallTerminalMeetingPath && question && !isAccountCommand) {
+        if (recallTerminalContextPending && question && !isAccountCommand) {
+          // null means "no meeting selected": the backend writes the general
+          // meeting-directory context instead, under the same auth gate.
+          const meetingPath = pendingRecallTerminalMeetingPath;
           try {
-            await invoke('cmd_prepare_recall_terminal_meeting', {
-              meetingPath: pendingRecallTerminalMeetingPath,
-            });
+            await invoke('cmd_prepare_recall_terminal_meeting', { meetingPath });
             pendingRecallTerminalMeetingPath = null;
+            recallTerminalContextPending = false;
             setRecallProviderNotice(
-              'The selected meeting is ready for this question. Terminal chat remains under your agent subscription.'
+              meetingPath
+                ? 'The selected meeting is ready for this question. Terminal chat remains under your agent subscription.'
+                : 'Your meeting directory is ready for this question. Terminal chat remains under your agent subscription.'
             );
           } catch (error) {
             // Do not forward Enter: the question remains in the terminal input,
@@ -15079,6 +15093,7 @@
           // clears any stale CURRENT_MEETING.md before a new question while
           // the backend keeps the already-running terminal session intact.
           await invoke('cmd_spawn_terminal', { mode: 'deferred', themeDark: isEffectiveDarkTheme() });
+          recallTerminalContextPending = true;
           recallPtyAlive = true;
           recallEndBtn.classList.add('active');
         } catch (e) {

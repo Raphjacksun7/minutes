@@ -1121,11 +1121,7 @@ fn compile_helper(source_path: &Path, bin_path: &Path) -> Result<()> {
 }
 
 fn content_type_label(content_type: ContentType) -> &'static str {
-    match content_type {
-        ContentType::Meeting => "meeting",
-        ContentType::Memo => "memo",
-        ContentType::Dictation => "dictation",
-    }
+    content_type.as_str()
 }
 
 fn locale_language_hint(locale: &str) -> Option<String> {

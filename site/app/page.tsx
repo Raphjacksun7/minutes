@@ -14,9 +14,9 @@ import { NumberedSectionLabel as SectionLabel } from "@/components/section-label
 const featureGrid = [
   {
     label: "For agents",
-    title: "Local audio context",
+    title: "Searchable local context",
     description:
-      `${MINUTES_MCP_TOOL_COUNT} MCP tools, live transcript reads, and structured markdown let Claude, Codex, Gemini CLI, and Cowork work from what was actually said.`,
+      `${MINUTES_MCP_TOOL_COUNT} MCP tools, live transcript reads, and policy-aware search across meetings and notes let Claude, Codex, Gemini CLI, and Cowork work from what was actually said.`,
   },
   {
     label: "For developers",
@@ -80,16 +80,16 @@ const capabilityColumns = [
         "Action items, decisions, and commitments become queryable markdown.",
       ],
       [
-        "Policy-bound people context",
-        "Build bounded policy-safe person profiles, topic research, relationship rankings, and commitments.",
+        "People memory",
+        "Who said what, what they committed to, and what you owe them, built only from meetings you let agents read.",
       ],
       [
         "Cross-meeting search",
-        "Search policy-authorized history or ask your assistant to pull the thread for you.",
+        "Search your own history, or ask your assistant to pull the thread across months of meetings.",
       ],
       [
         "Voice memo pipeline",
-        "iPhone recordings arrive on Mac and join the same policy-safe search corpus.",
+        "iPhone recordings land on your Mac and join the same searchable folder.",
       ],
     ],
   },
@@ -116,7 +116,7 @@ const capabilityColumns = [
   },
 ] as const;
 
-// Public product documentation reviewed September 5, 2026. See linked comparisons.
+// Public product documentation reviewed September 15, 2026. See linked comparisons.
 const comparisons = [
   ["Product", "Hosted meeting notepad", "Hosted meeting assistant", "Local meeting notepad", "Local conversation memory"],
   ["Agent access", "Hosted MCP", "Hosted integrations", "CLI + MCP", `Files + ${MINUTES_MCP_TOOL_COUNT} MCP tools`],
@@ -350,7 +350,7 @@ export default function Home() {
           The product, in motion
         </p>
         <h2 className="mx-auto max-w-[680px] font-serif text-[36px] leading-[1.02] tracking-[-0.04em] text-[var(--text)] sm:text-[48px]">
-          The interface is the evidence.
+          Watch it transcribe a meeting. Then read the file it wrote.
         </h2>
         <p className="mx-auto mt-5 max-w-[650px] text-[15px] leading-7 text-[var(--text-secondary)] sm:text-[16px]">
           Minutes captures locally, writes one inspectable Markdown file, and
@@ -367,14 +367,14 @@ export default function Home() {
         </div>
 
         <p className="mx-auto mt-4 max-w-[560px] text-[14px] leading-6 text-[var(--text-secondary)]">
-          Minutes keeps the raw transcript visible. The structure is the
-          interface: timestamps, speakers, action items, and decisions stay
-          readable even before an assistant touches them.
+          Minutes keeps the raw transcript visible. Timestamps, speakers,
+          action items, and decisions stay readable even before an assistant
+          touches them.
         </p>
 
         <p className="mx-auto mt-12 max-w-[620px] rounded-[5px] border border-[color:var(--border)] bg-[var(--bg-elevated)] px-4 py-3 font-mono text-[12px] leading-5 text-[var(--text-secondary)]">
           <span className="text-[var(--accent)]">v{MINUTES_RELEASE_VERSION}</span>{" "}
-          keeps consistency reports in the meeting folder you selected and lets you try sample recall without downloading speech models. On Apple Silicon, automatic transcription can use Parakeet when its plugin and model are ready.{" "}
+          makes prep briefs and other Markdown notes visible in list and search, and prevents concurrent setup processes from racing over one model download.{" "}
           <a
             href={`https://github.com/silverstein/minutes/releases/tag/v${MINUTES_RELEASE_VERSION}`}
             className="text-[var(--text)] underline decoration-[color:var(--border-mid)] underline-offset-2 hover:text-[var(--accent)]"
@@ -572,9 +572,9 @@ export default function Home() {
           How it works
         </h2>
         <pre className="mt-6 overflow-x-auto rounded-[8px] border border-[color:var(--border)] bg-[var(--bg-elevated)] p-5 font-mono text-[13px] leading-7 text-[var(--text-secondary)] shadow-[var(--shadow-panel)]">
-{`Audio -> Transcribe -> Diarize -> Summarize -> Markdown -> Policy-safe Search
-       (local)      (local)    (your LLM)  (decisions,   (live authorized,
-      speech model  pyannote   Claude /     action items) bounded reads)
+{`Audio -> Transcribe -> Diarize -> Summarize -> Markdown -> Recall
+       (local)      (local)    (your LLM)  (decisions,   (agents read
+      speech model  pyannote   Claude /     action items)  what you allow)
                                 Ollama`}
         </pre>
         <p className="mt-5 max-w-[660px] text-[15px] leading-7 text-[var(--text-secondary)]">
@@ -772,9 +772,9 @@ export default function Home() {
               Next
             </p>
             <p className="mt-3 text-[14px] leading-6 text-[var(--text-secondary)]">
-              Retention rules the corpus enforces on its own audio, and
-              enforcement of the sensitivity contract across every agent
-              surface, not just the debrief path.
+              Retention rules the folder enforces on its own audio, and the
+              same restrictions applied everywhere an agent reads, not just in
+              one command.
             </p>
           </div>
           <div className="rounded-[8px] border border-[color:var(--border)] bg-[var(--bg-elevated)] p-5 shadow-[var(--shadow-panel)]">
@@ -783,8 +783,8 @@ export default function Home() {
             </p>
             <p className="mt-3 text-[14px] leading-6 text-[var(--text-secondary)]">
               Sensitivity metadata your agents are required to respect: a
-              restricted meeting is excluded from default agent search,
-              bounded profiles, and anything an agent assembles.
+              restricted meeting is excluded from agent search, people
+              profiles, and anything an agent assembles.
             </p>
           </div>
         </div>

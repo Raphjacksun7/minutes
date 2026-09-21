@@ -74,7 +74,7 @@ import { access, mkdir, readFile, rm, stat, writeFile } from "fs/promises";
 import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 import * as reader from "minutes-sdk";
 import {
@@ -810,13 +810,14 @@ export function parsePolicyVerifiedMeeting(
   const { yaml } = reader.splitFrontmatter(content);
   if (!yaml) return null;
 
+  let parsedFrontmatter: Record<string, unknown>;
   try {
     const parsed = parseYaml(yaml);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
     if (typeof parsed.title !== "string" || parsed.title.trim() === "") return null;
     if (
       typeof parsed.type !== "string" ||
-      !["meeting", "memo", "dictation"].includes(parsed.type)
+      !["meeting", "memo", "dictation", "note"].includes(parsed.type)
     ) {
       return null;
     }
@@ -830,11 +831,29 @@ export function parsePolicyVerifiedMeeting(
     ) {
       return null;
     }
+    parsedFrontmatter = parsed as Record<string, unknown>;
   } catch {
     return null;
   }
 
-  return reader.parseFrontmatter(content, filePath);
+  const sdkParsed = reader.parseFrontmatter(content, filePath);
+  if (sdkParsed || parsedFrontmatter.type !== "note") return sdkParsed;
+
+  // The MCP package is tested against the last published SDK, which can lag
+  // this repository by one release. Preserve that parser's normalization and
+  // fail-closed checks while adapting only the newly valid discriminator.
+  const { body } = reader.splitFrontmatter(content);
+  const sdkCompatibleContent = [
+    "---",
+    stringifyYaml({ ...parsedFrontmatter, type: "meeting" }).trimEnd(),
+    "---",
+    body,
+  ].join("\n");
+  const note = reader.parseFrontmatter(sdkCompatibleContent, filePath);
+  if (!note) return null;
+  note.frontmatter.type = "note";
+  note.body = body;
+  return note;
 }
 
 type PolicyVerifiedMeeting = NonNullable<
@@ -2222,7 +2241,7 @@ const COPILOT_SUPPORTED = hasFeature(CLI_CAPABILITIES, "copilot_realtime");
 // `./version.ts` (see issue #183). Hosted `.mcpb` bundles will run
 // against CLIs with different minor/patch numbers within the same
 // major; that is explicitly supported.
-const MCP_SERVER_VERSION = "0.26.0";
+const MCP_SERVER_VERSION = "0.26.3";
 
 export function parseKnowledgeConfig(configContent: string): KnowledgeConfigStatus | null {
   const knowledgeMatch = configContent.match(/\[knowledge\][\s\S]*?(?=\n\[|$)/);

@@ -36,7 +36,7 @@ schema version bump. Additive fields do not.
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `title` | string | ✓ | Human-readable title. LLM-generated during ingest, editable. |
-| `type` | enum | ✓ | One of: `meeting`, `memo`, `dictation`. |
+| `type` | enum | ✓ | One of: `meeting`, `memo`, `dictation`, `note`. |
 | `date` | datetime | ✓ | ISO-8601 with timezone. Example: `2026-03-17T14:00:00-07:00`. |
 | `duration` | string | ✓ | Human-friendly, e.g. `42m`, `1h 5m`. |
 
@@ -524,6 +524,6 @@ Questions, feature requests, or interop issues belong in
 
 ---
 
-_Last updated: 2026-05-07 — corresponds to Minutes v0.16.3. Schema is
-unchanged since v0.13.2 frontmatter v2 additions (`authority`, `supersedes`
-on `Decision`)._
+_Last updated: 2026-09-15. Corresponds to Minutes v0.26.3, which added the
+`note` corpus type. The frontmatter v2 `authority` and `supersedes` fields on
+`Decision` are unchanged._

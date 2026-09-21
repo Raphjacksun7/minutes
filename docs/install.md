@@ -233,8 +233,8 @@ minutes setup --diarization
 # Build the plugin, then the CLI, then copy the plugin where the CLI looks:
 #   (cd crates/sherpa-plugin && cargo build --release)
 #   cargo build --release -p minutes-cli --features engine-sherpa,metal
-#   mkdir -p ~/.minutes/lib && \
-#     cp crates/sherpa-plugin/target/release/libminutes_sherpa.dylib ~/.minutes/lib/
+#     cp crates/sherpa-plugin/target/release/libminutes_sherpa.dylib ~/.local/bin/
+#   (beside the minutes binary, wherever you installed it)
 # Then enable in one command:
 minutes setup --sherpa        # downloads the int8 ONNX model (~670MB) + sets engine = "sherpa"
 # If you select sherpa without the feature, model, or plugin, transcription auto-falls-back
@@ -316,6 +316,16 @@ Because an apply rewrites summary-derived frontmatter, everything computed from 
 > **Platform notes:** Calendar integration (auto-detecting meeting attendees) requires macOS. Screen context capture works on macOS and Linux. The voice memo pipeline works on all platforms — any folder sync (iCloud, Dropbox, Google Drive, Syncthing) can feed the watcher. The `minutes service install` auto-start command requires macOS (launchd); on Linux, use systemd or cron. Speaker diarization (`pyannote-rs`) works on all platforms (CLI, Tauri app, and via MCP). All other features — recording, transcription, search, action items, person profiles — work on all platforms.
 
 ### Desktop app
+
+macOS source builds require the macOS 26 SDK from Xcode 26 or newer, including
+when the resulting app will run on macOS 15. The older Xcode 16 command-line
+tools do not include the Apple Speech declarations used by the build. Select
+an installed Xcode 26 before building; for example, with Xcode 26.3 installed:
+
+```bash
+export DEVELOPER_DIR=/Applications/Xcode_26.3.app/Contents/Developer
+xcrun --sdk macosx --show-sdk-version  # must report 26 or newer
+```
 
 ```bash
 # macOS — Homebrew cask (recommended)

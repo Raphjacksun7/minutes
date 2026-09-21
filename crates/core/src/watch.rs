@@ -974,11 +974,7 @@ pub fn compressed_audio_ffmpeg_guidance() -> &'static str {
 }
 
 fn content_type_label(content_type: ContentType) -> &'static str {
-    match content_type {
-        ContentType::Meeting => "meeting",
-        ContentType::Memo => "memo",
-        ContentType::Dictation => "dictation",
-    }
+    content_type.as_str()
 }
 
 #[cfg(feature = "parakeet")]

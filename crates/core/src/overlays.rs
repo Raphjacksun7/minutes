@@ -1016,7 +1016,21 @@ pub(crate) fn stable_speaker_overlay_snapshot_at_until(
     check_deadline()?;
     if let Some(parent) = db_path.parent() {
         match fs::symlink_metadata(parent) {
-            Ok(_) => secure_private_parent(parent)?,
+            Ok(_) => {
+                // A reader with no correction database has no private bytes to
+                // admit. Check absence through the same no-follow capabilities
+                // used by policy reads, without tightening an ordinary state
+                // root just because search asked for an empty snapshot (#973).
+                let directory = crate::policy_fs::BoundRecoveryDirectory::bind_existing(parent)?;
+                let name = db_path.file_name().ok_or_else(|| {
+                    std::io::Error::other("speaker correction store has no file name")
+                })?;
+                if !directory.entry_exists(name)? {
+                    directory.attest_for_source_cleanup()?;
+                    return Ok(StableSpeakerOverlaySnapshot::empty());
+                }
+                secure_private_parent(parent)?;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
@@ -1046,7 +1060,7 @@ pub(crate) fn stable_speaker_overlay_snapshot_at_until(
             | OpenFlags::SQLITE_OPEN_NOFOLLOW
             | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
     )?;
-    conn.progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline));
+    conn.progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline))?;
     conn.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA query_only=ON; BEGIN")?;
     let temp_mode: i64 = conn.query_row("PRAGMA temp_store", [], |row| row.get(0))?;
     if temp_mode != 2 {
@@ -1344,6 +1358,32 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("byte budget"));
         assert!(!db.exists());
+    }
+
+    #[test]
+    fn missing_overlay_snapshot_does_not_change_state_directory_permissions() {
+        let root = TempDir::new().unwrap();
+        let state = root.path().join("state");
+        fs::create_dir(&state).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o750)).unwrap();
+        }
+
+        let snapshot = stable_speaker_overlay_snapshot_at(&state.join("overlays.db")).unwrap();
+        assert_eq!(snapshot.confirmations().count(), 0);
+        assert_eq!(fs::read_dir(&state).unwrap().count(), 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+                0o750
+            );
+        }
+        #[cfg(windows)]
+        assert!(crate::policy_fs::BoundRecoveryDirectory::prepare_owner_private(&state).is_err());
     }
 
     #[test]
