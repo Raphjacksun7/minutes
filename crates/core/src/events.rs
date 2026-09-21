@@ -436,6 +436,7 @@ fn with_event_log_lock<T>(f: impl FnOnce() -> std::io::Result<T>) -> std::io::Re
         fs::create_dir_all(parent)?;
     }
 
+    #[cfg(unix)]
     let creating = !path.exists();
     let file = OpenOptions::new()
         .create(true)
@@ -654,6 +655,7 @@ fn append_event_inner(envelope: &EventEnvelope) -> std::io::Result<EventEnvelope
             fs::create_dir_all(parent)?;
         }
 
+        #[cfg(unix)]
         let creating = !path.exists();
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
 
