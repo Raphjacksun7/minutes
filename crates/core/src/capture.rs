@@ -608,6 +608,10 @@ impl VoiceCaptureStream {
         if let Self::PocketStation(stream) = self {
             use crate::pocketstation_microphone::MicrophoneSignalState;
             let observations = stream.observations();
+            eprintln!(
+                "[minutes] PocketStation microphone recovery reason: {:?}",
+                observations.state
+            );
             tracing::warn!(
                 state = ?observations.state,
                 native_format = ?observations.native_format,
@@ -1830,6 +1834,7 @@ fn record_to_wav_dual_source(
     let mut voice_stream = match VoiceCaptureStream::start(&plan) {
         Ok(stream) => Some(stream),
         Err(error) if plan.uses_pocketstation_microphone() => {
+            eprintln!("[minutes] PocketStation microphone did not start: {error}");
             tracing::error!(
                 error = %error,
                 "PocketStation microphone did not start; continuing the healthy system stem"
@@ -1847,7 +1852,10 @@ fn record_to_wav_dual_source(
         .unwrap_or_else(|| plan.call_device_name.clone());
     // Call side is always a pinned override; voice side is pinned iff the caller
     // supplied an explicit override. Pinned sides skip default-device-change polling.
-    let voice_pinned = plan.voice_override.is_some();
+    // The generic monitor tracks names, while the PocketStation source is
+    // pinned to the exact device identity selected at start. PKS source health
+    // triggers host recovery, which explicitly re-resolves default/fallback.
+    let voice_pinned = plan.voice_override.is_some() || plan.uses_pocketstation_microphone();
     let monitored_voice_name = voice_stream
         .as_ref()
         .map(VoiceCaptureStream::device_name)
@@ -1966,6 +1974,9 @@ fn record_to_wav_dual_source(
             );
 
         if voice_issue {
+            if voice_route_issue {
+                eprintln!("[minutes] Microphone recovery reason: default input route changed");
+            }
             tracing::warn!("voice stream issue detected — applying bounded voice-only recovery");
             let previous_voice_name = voice_stream
                 .as_ref()

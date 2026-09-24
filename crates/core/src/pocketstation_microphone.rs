@@ -24,6 +24,7 @@ const CONTROL_QUEUE_CAPACITY: usize = 4;
 const POCKETSTATION_SAMPLE_RATE_HZ: u32 = 48_000;
 const MINUTES_SAMPLE_RATE_HZ: u32 = 16_000;
 const MAX_SEQUENCE_GAP_DURATION: Duration = Duration::from_secs(2);
+const MAX_TIMESTAMP_JITTER: Duration = Duration::from_millis(2);
 const SOURCE_FRAME_DURATION_NS: u64 = 10_000_000;
 const SOURCE_FRAME_SAMPLES: usize =
     (MINUTES_SAMPLE_RATE_HZ as usize * SOURCE_FRAME_DURATION_NS as usize) / 1_000_000_000;
@@ -73,47 +74,37 @@ impl MicrophoneSelection {
         device_override: Option<&str>,
         resolved_default_name: &str,
     ) -> Result<Self, CaptureError> {
-        let requested = device_override
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"))
-            .unwrap_or(resolved_default_name);
+        use cpal::traits::{DeviceTrait, HostTrait};
 
-        let mut matching = pocketstation::discover_sources()
-            .into_iter()
-            .filter(|source| source.stable_id.kind == SourceKind::InputDevice)
-            .filter(|source| {
-                source.name.eq_ignore_ascii_case(requested)
-                    || source
-                        .device_uid
-                        .as_deref()
-                        .is_some_and(|device_uid| device_uid == requested)
-            });
-        let selected = matching.next().ok_or_else(|| {
-            capture_error(
-                "select PocketStation microphone",
-                format!("no input device matches '{requested}'"),
+        let explicit_request = device_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"));
+        let (requested, exact_device_id) = if let Some(requested) = explicit_request {
+            (requested.to_owned(), None)
+        } else {
+            let default = cpal::default_host().default_input_device().ok_or_else(|| {
+                capture_error(
+                    "select PocketStation microphone",
+                    "no default input device is available",
+                )
+            })?;
+            let device_id = default.id().map_err(|error| {
+                capture_error(
+                    "select PocketStation microphone",
+                    format!("read default input device identity: {error}"),
+                )
+            })?;
+            (
+                resolved_default_name.to_owned(),
+                Some(device_id.to_string()),
             )
-        })?;
-        if matching.next().is_some() {
-            return Err(capture_error(
-                "select PocketStation microphone",
-                format!("more than one input device matches '{requested}'"),
-            ));
-        }
-        let device_uid = selected.device_uid.ok_or_else(|| {
-            capture_error(
-                "select PocketStation microphone",
-                format!(
-                    "input device '{}' has no stable device identifier",
-                    selected.name
-                ),
-            )
-        })?;
-        Ok(Self {
-            selector: DeviceSelector::id(DeviceId::new(device_uid.clone())),
-            device_id: device_uid,
-            display_name: selected.name,
-        })
+        };
+
+        select_discovered_microphone(
+            discovered_microphones(),
+            &requested,
+            exact_device_id.as_deref(),
+        )
     }
 
     fn recovery_fallback(
@@ -121,18 +112,7 @@ impl MicrophoneSelection {
         resolved_default_name: &str,
     ) -> Result<Self, CaptureError> {
         let default = Self::resolve(None, resolved_default_name).ok();
-        let alternatives = pocketstation::discover_sources()
-            .into_iter()
-            .filter(|source| source.stable_id.kind == SourceKind::InputDevice)
-            .filter_map(|source| {
-                let device_id = source.device_uid?;
-                Some(Self {
-                    selector: DeviceSelector::id(DeviceId::new(device_id.clone())),
-                    device_id,
-                    display_name: source.name,
-                })
-            })
-            .collect::<Vec<_>>();
+        let alternatives = discovered_microphones();
         choose_recovery_fallback(current_device_id, default, alternatives).ok_or_else(|| {
             capture_error(
                 "select PocketStation microphone fallback",
@@ -140,6 +120,47 @@ impl MicrophoneSelection {
             )
         })
     }
+}
+
+fn select_discovered_microphone(
+    sources: Vec<MicrophoneSelection>,
+    requested: &str,
+    exact_device_id: Option<&str>,
+) -> Result<MicrophoneSelection, CaptureError> {
+    let mut matching = sources.into_iter().filter(|source| {
+        exact_device_id.map_or_else(
+            || source.display_name.eq_ignore_ascii_case(requested) || source.device_id == requested,
+            |device_id| source.device_id == device_id,
+        )
+    });
+    let selected = matching.next().ok_or_else(|| {
+        capture_error(
+            "select PocketStation microphone",
+            format!("no input device matches '{requested}'"),
+        )
+    })?;
+    if matching.next().is_some() {
+        return Err(capture_error(
+            "select PocketStation microphone",
+            format!("more than one input device matches '{requested}'"),
+        ));
+    }
+    Ok(selected)
+}
+
+fn discovered_microphones() -> Vec<MicrophoneSelection> {
+    pocketstation::discover_sources()
+        .into_iter()
+        .filter(|source| source.stable_id.kind == SourceKind::InputDevice)
+        .filter_map(|source| {
+            let device_id = source.device_uid?;
+            Some(MicrophoneSelection {
+                selector: DeviceSelector::id(DeviceId::new(device_id.clone())),
+                device_id,
+                display_name: source.name,
+            })
+        })
+        .collect()
 }
 
 fn choose_recovery_fallback(
@@ -332,6 +353,9 @@ impl PocketStationMicrophoneStream {
                         Ok(Some(batch)) => {
                             for frame_index in 0..batch.len() {
                                 let Some(frame) = batch.frame(frame_index) else {
+                                    eprintln!(
+                                        "[minutes] PocketStation microphone returned an invalid frame lease at batch index {frame_index}"
+                                    );
                                     failed.store(true, Ordering::Relaxed);
                                     break;
                                 };
@@ -343,6 +367,9 @@ impl PocketStationMicrophoneStream {
                                     &sink,
                                     &dropped_chunks_total,
                                 ) {
+                                    eprintln!(
+                                        "[minutes] PocketStation microphone frame conversion failed: {error}"
+                                    );
                                     tracing::error!(error = %error, "PocketStation microphone stopped");
                                     failed.store(true, Ordering::Relaxed);
                                     break;
@@ -351,6 +378,9 @@ impl PocketStationMicrophoneStream {
                         }
                         Ok(None) => {}
                         Err(error) => {
+                            eprintln!(
+                                "[minutes] PocketStation microphone polling failed: {error}"
+                            );
                             tracing::error!(error = %error, "PocketStation microphone polling failed");
                             failed.store(true, Ordering::Relaxed);
                         }
@@ -360,7 +390,11 @@ impl PocketStationMicrophoneStream {
                         running.try_recv_event()
                     {
                         match event.kind() {
-                            SessionEventKind::Source(_) => {
+                            SessionEventKind::Source(failure) => {
+                                eprintln!(
+                                    "[minutes] PocketStation microphone source failed: {:?}",
+                                    failure.event()
+                                );
                                 source_failed.store(true, Ordering::Relaxed);
                             }
                             SessionEventKind::Endpoint(_)
@@ -369,12 +403,20 @@ impl PocketStationMicrophoneStream {
                             | SessionEventKind::Lifecycle(
                                 pocketstation::SessionLifecycleState::Failed,
                             ) => {
+                                eprintln!(
+                                    "[minutes] PocketStation microphone session failed: {:?}",
+                                    event.kind()
+                                );
                                 failed.store(true, Ordering::Relaxed);
                             }
                             SessionEventKind::Terminal(outcome)
                                 if outcome.state()
                                     == pocketstation::SessionTerminalState::Failed =>
                             {
+                                eprintln!(
+                                    "[minutes] PocketStation microphone terminal failure: {:?}",
+                                    outcome
+                                );
                                 failed.store(true, Ordering::Relaxed);
                             }
                             _ => {}
@@ -398,6 +440,7 @@ impl PocketStationMicrophoneStream {
                 cancel_succeeded.store(cancellation_succeeded, Ordering::Release);
                 cancel_completed.store(true, Ordering::Release);
                 if !cancellation_succeeded {
+                    eprintln!("[minutes] PocketStation microphone cancellation failed");
                     failed.store(true, Ordering::Relaxed);
                 }
                 let _ = worker_finished.try_send(());
@@ -790,13 +833,35 @@ fn same_source_interval(left: AudioChunkLineage, right: AudioChunkLineage) -> bo
 fn contiguous_source_interval(left: AudioChunkLineage, right: AudioChunkLineage) -> bool {
     same_source_interval(left, right)
         && right.first_sequence_number == left.last_sequence_number.saturating_add(1)
-        && right.timestamp_start_ns == left.timestamp_end_ns()
+        && source_timestamps_plausible(left, right)
+}
+
+fn source_timestamps_plausible(left: AudioChunkLineage, right: AudioChunkLineage) -> bool {
+    if right.timestamp_start_ns <= left.timestamp_start_ns {
+        return false;
+    }
+    let Some(missing_sequences) = right
+        .first_sequence_number
+        .checked_sub(left.last_sequence_number.saturating_add(1))
+    else {
+        return false;
+    };
+    let expected_start_ns = left
+        .timestamp_end_ns()
+        .saturating_add(missing_sequences.saturating_mul(SOURCE_FRAME_DURATION_NS));
+    right.timestamp_start_ns.abs_diff(expected_start_ns) <= MAX_TIMESTAMP_JITTER.as_nanos() as u64
 }
 
 fn missing_source_frames(
     left: AudioChunkLineage,
     right: AudioChunkLineage,
 ) -> Result<u64, CaptureError> {
+    if !source_timestamps_plausible(left, right) {
+        return Err(capture_error(
+            "preserve PocketStation microphone timeline",
+            "source timestamps did not advance within the bounded repair window",
+        ));
+    }
     let missing_sequences = right
         .first_sequence_number
         .checked_sub(left.last_sequence_number.saturating_add(1))
@@ -806,38 +871,13 @@ fn missing_source_frames(
                 "source sequence moved backwards or overlapped",
             )
         })?;
-    let missing_duration_ns = right
-        .timestamp_start_ns
-        .checked_sub(left.timestamp_end_ns())
-        .ok_or_else(|| {
-            capture_error(
-                "preserve PocketStation microphone timeline",
-                "source timestamp moved backwards or overlapped",
-            )
-        })?;
+    let missing_duration_ns = missing_sequences.saturating_mul(SOURCE_FRAME_DURATION_NS);
     if missing_duration_ns > MAX_SEQUENCE_GAP_DURATION.as_nanos() as u64 {
         return Err(capture_error(
             "preserve PocketStation microphone timeline",
             format!(
                 "source gap of {missing_duration_ns} ns exceeds the bounded {} ns repair window",
                 MAX_SEQUENCE_GAP_DURATION.as_nanos()
-            ),
-        ));
-    }
-    if !missing_duration_ns.is_multiple_of(SOURCE_FRAME_DURATION_NS) {
-        return Err(capture_error(
-            "preserve PocketStation microphone timeline",
-            format!(
-                "source gap of {missing_duration_ns} ns is not an integral 10 ms frame interval"
-            ),
-        ));
-    }
-    let missing_timestamp_frames = missing_duration_ns / SOURCE_FRAME_DURATION_NS;
-    if missing_timestamp_frames != missing_sequences {
-        return Err(capture_error(
-            "preserve PocketStation microphone timeline",
-            format!(
-                "source gap disagrees: {missing_sequences} missing sequence numbers but {missing_timestamp_frames} missing timestamp frames"
             ),
         ));
     }
@@ -968,6 +1008,35 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_default_display_name_resolves_by_exact_device_identity() {
+        let selected = select_discovered_microphone(
+            vec![
+                selection("other-uid", "MacBook Pro Microphone"),
+                selection("default-uid", "MacBook Pro Microphone"),
+            ],
+            "MacBook Pro Microphone",
+            Some("default-uid"),
+        )
+        .unwrap();
+
+        assert_eq!(selected.device_id, "default-uid");
+    }
+
+    #[test]
+    fn explicit_ambiguous_display_name_remains_rejected() {
+        let result = select_discovered_microphone(
+            vec![
+                selection("first-uid", "Duplicate Microphone"),
+                selection("second-uid", "Duplicate Microphone"),
+            ],
+            "Duplicate Microphone",
+            None,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn fallback_uses_the_default_when_the_original_device_disappeared() {
         let fallback = choose_recovery_fallback(
             None,
@@ -1074,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    fn source_gap_is_bounded_and_must_match_sequence_and_timestamp_evidence() {
+    fn source_gap_is_bounded_by_sequence_while_preserving_native_timestamps() {
         let first = AudioChunkLineage {
             session_id: 1,
             source_id: 202,
@@ -1107,13 +1176,55 @@ mod tests {
         };
         assert!(missing_source_frames(first, inconsistent).is_err());
 
-        let unbounded = AudioChunkLineage {
-            first_sequence_number: 222,
-            last_sequence_number: 222,
+        let jittered_gap = AudioChunkLineage {
+            first_sequence_number: 23,
+            last_sequence_number: 23,
+            timestamp_start_ns: 1_030_000_000 - 106_167,
+            ..first
+        };
+        assert_eq!(missing_source_frames(first, jittered_gap).unwrap(), 2);
+
+        let jittered = AudioChunkLineage {
+            first_sequence_number: 21,
+            last_sequence_number: 21,
+            timestamp_start_ns: first.timestamp_end_ns().saturating_sub(106_167),
+            ..first
+        };
+        assert!(contiguous_source_interval(first, jittered));
+
+        let repeated_start = AudioChunkLineage {
+            first_sequence_number: 21,
+            last_sequence_number: 21,
+            timestamp_start_ns: first.timestamp_start_ns,
+            ..first
+        };
+        assert!(!contiguous_source_interval(first, repeated_start));
+        assert!(missing_source_frames(first, repeated_start).is_err());
+
+        let unbounded_timestamp = AudioChunkLineage {
+            first_sequence_number: 21,
+            last_sequence_number: 21,
             timestamp_start_ns: first
                 .timestamp_end_ns()
                 .saturating_add(MAX_SEQUENCE_GAP_DURATION.as_nanos() as u64)
-                .saturating_add(SOURCE_FRAME_DURATION_NS),
+                .saturating_add(1),
+            ..first
+        };
+        assert!(!contiguous_source_interval(first, unbounded_timestamp));
+        assert!(missing_source_frames(first, unbounded_timestamp).is_err());
+
+        let adjacent_but_far_away = AudioChunkLineage {
+            first_sequence_number: 21,
+            last_sequence_number: 21,
+            timestamp_start_ns: first.timestamp_end_ns().saturating_add(1_000_000_000),
+            ..first
+        };
+        assert!(!contiguous_source_interval(first, adjacent_but_far_away));
+        assert!(missing_source_frames(first, adjacent_but_far_away).is_err());
+
+        let unbounded = AudioChunkLineage {
+            first_sequence_number: 222,
+            last_sequence_number: 222,
             ..first
         };
         assert!(missing_source_frames(first, unbounded).is_err());
