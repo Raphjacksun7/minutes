@@ -171,6 +171,9 @@ jobs:
         # breakage here only surfaces when Prompter next runs cargo build.
         run: cargo build -p minutes-core --no-default-features --features streaming
 
+      # The macOS microphone-supervision branch uses accepted Core APIs that
+      # are not yet in the public 1.1.10 crate. Widen these three steps to
+      # macOS only after Minutes points at the released Core version.
       - name: Build PocketStation capture (Windows and Linux)
         if: runner.os == 'Windows' || runner.os == 'Linux'
         run: cargo build -p minutes-core --no-default-features --features pocketstation-capture
@@ -182,7 +185,12 @@ jobs:
 
       - name: Clippy PocketStation capture (Windows and Linux)
         if: runner.os == 'Windows' || runner.os == 'Linux'
-        run: cargo clippy -p minutes-core --no-default-features --features pocketstation-capture -- -D warnings
+        # This is the strict changed-code gate for the library target that owns
+        # the integration. It does not claim that the repository's inherited
+        # all-target warnings are clean. The workspace/all-target command in
+        # docs/release/pre-release-checklist.md remains a publication/rebase
+        # gate and must pass before this feature can ship.
+        run: cargo clippy -p minutes-core --lib --no-default-features --features pocketstation-capture -- -D warnings
 
       - name: Build core with parakeet (cross-platform)
         # Guards against Linux-parakeet breakage that today only surfaces
