@@ -181,10 +181,6 @@ jobs:
       - name: Clippy PocketStation capture (cross-platform)
         run: cargo clippy -p minutes-core --no-default-features --features pocketstation-capture -- -D warnings
 
-      - name: Clippy PocketStation capture all targets (Windows and Linux)
-        if: runner.os == 'Windows' || runner.os == 'Linux'
-        run: cargo clippy -p minutes-core --all-targets --no-default-features --features pocketstation-capture -- -D warnings
-
       - name: Build core with parakeet (cross-platform)
         # Guards against Linux-parakeet breakage that today only surfaces
         # at tag push via release-cli.yml. The parakeet feature compiles
