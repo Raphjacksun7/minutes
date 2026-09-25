@@ -686,6 +686,9 @@ impl VoiceCaptureStream {
         plan: &DualCapturePlan,
         action: VoiceRecoveryAction,
     ) -> Result<RecoveredVoiceStream, CaptureError> {
+        #[cfg(not(all(feature = "pocketstation-capture", target_os = "macos")))]
+        let _ = action;
+
         match self {
             Self::Cpal(stream) => {
                 drop(stream);
