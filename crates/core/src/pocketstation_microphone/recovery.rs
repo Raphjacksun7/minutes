@@ -3,7 +3,6 @@ use super::selection::{MicrophoneDiagnosticIdentity, MicrophoneSelection};
 use super::{capture_error, PocketStationMicrophoneStream};
 use crate::error::CaptureError;
 use pocketstation::{DeviceSelector, SessionSourceReplacement, SessionSourceReplacementError};
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -202,7 +201,7 @@ impl PocketStationMicrophoneStream {
                 return None;
             }
             self.clear_pending_replacement();
-            self.failed.store(true, Ordering::Relaxed);
+            self.worker.mark_failed();
             return Some(MicrophoneReplacementReconciliation::Detached {
                 source_generation: replacement.source_generation,
                 discontinuity_epoch: replacement.discontinuity_epoch,
@@ -237,7 +236,7 @@ impl PocketStationMicrophoneStream {
 
     fn fail_pending_replacement(&mut self, message: String) -> MicrophoneReplacementReconciliation {
         self.clear_pending_replacement();
-        self.failed.store(true, Ordering::Relaxed);
+        self.worker.mark_failed();
         MicrophoneReplacementReconciliation::Failed(message)
     }
 
@@ -326,7 +325,8 @@ impl PocketStationMicrophoneStream {
         let pending_generation = observations.source_generation.saturating_add(1);
         let pending_discontinuity = observations.discontinuity_epoch.saturating_add(1);
         let (response, receiver) = crossbeam_channel::bounded(1);
-        self.control
+        self.worker
+            .control()
             .send_timeout(command(response), CONTROL_TIMEOUT)
             .map_err(|error| capture_error("send PocketStation microphone control", error))?;
         match receiver.recv_timeout(CONTROL_TIMEOUT) {
