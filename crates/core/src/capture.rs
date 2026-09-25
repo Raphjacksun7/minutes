@@ -746,6 +746,14 @@ fn recovery_action(
 }
 
 #[cfg(feature = "streaming")]
+fn automatic_microphone_fallback_allowed(normalized_selection: Option<&str>) -> bool {
+    normalized_selection.is_none_or(|selection| {
+        let selection = selection.trim();
+        selection.is_empty() || selection.eq_ignore_ascii_case("default")
+    })
+}
+
+#[cfg(feature = "streaming")]
 fn continue_without_voice(independent_failure: bool, allow_degraded_call_capture: bool) -> bool {
     independent_failure || allow_degraded_call_capture
 }
@@ -1999,7 +2007,8 @@ fn record_to_wav_dual_source(
             // retry that physical source once, but never substitute another
             // microphone without a separate user opt-in. Following the system
             // default retains Minutes' existing default-device fallback policy.
-            let automatic_fallback_allowed = plan.voice_override.is_none();
+            let automatic_fallback_allowed =
+                automatic_microphone_fallback_allowed(plan.voice_override.as_deref());
             let fallback_withheld = voice_recovery_stage == VoiceRecoveryStage::FallbackRequired
                 && !automatic_fallback_allowed;
             let action = recovery_action(
@@ -4568,39 +4577,109 @@ mod tests {
 
     #[cfg(feature = "streaming")]
     #[test]
-    fn microphone_recovery_is_exact_once_then_fallback_once_then_degraded() {
+    fn default_following_microphone_retries_then_falls_back_once() {
+        let automatic_fallback_allowed = automatic_microphone_fallback_allowed(None);
+        assert!(automatic_fallback_allowed);
+        assert!(automatic_microphone_fallback_allowed(Some("default")));
+        assert!(automatic_microphone_fallback_allowed(Some(" DEFAULT ")));
         assert_eq!(
-            recovery_action(VoiceRecoveryStage::ExactRetryAvailable, false, false, true),
+            recovery_action(
+                VoiceRecoveryStage::ExactRetryAvailable,
+                false,
+                false,
+                automatic_fallback_allowed,
+            ),
             Some(VoiceRecoveryAction::ReopenExact)
         );
         assert_eq!(
-            recovery_action(VoiceRecoveryStage::FallbackRequired, false, false, true),
+            recovery_action(
+                VoiceRecoveryStage::ExactRetryAvailable,
+                true,
+                false,
+                automatic_fallback_allowed,
+            ),
+            Some(VoiceRecoveryAction::ReplaceWithFallback),
+            "following the default route selects its newly resolved physical device"
+        );
+        assert_eq!(
+            recovery_action(
+                VoiceRecoveryStage::FallbackRequired,
+                false,
+                false,
+                automatic_fallback_allowed,
+            ),
             Some(VoiceRecoveryAction::ReplaceWithFallback)
         );
         assert_eq!(
-            recovery_action(VoiceRecoveryStage::FallbackExhausted, false, false, true),
+            recovery_action(
+                VoiceRecoveryStage::FallbackExhausted,
+                false,
+                false,
+                automatic_fallback_allowed,
+            ),
             None
         );
         assert_eq!(
-            recovery_action(VoiceRecoveryStage::FallbackExhausted, true, false, true),
+            recovery_action(
+                VoiceRecoveryStage::FallbackExhausted,
+                true,
+                false,
+                automatic_fallback_allowed,
+            ),
             None
         );
         assert_eq!(
-            recovery_action(VoiceRecoveryStage::FallbackRequired, false, true, true),
+            recovery_action(
+                VoiceRecoveryStage::FallbackRequired,
+                false,
+                true,
+                automatic_fallback_allowed,
+            ),
             Some(VoiceRecoveryAction::ReplaceWithFallback)
-        );
-        assert_eq!(
-            recovery_action(VoiceRecoveryStage::ExactRetryAvailable, true, false, false),
-            Some(VoiceRecoveryAction::ReopenExact),
-            "an explicitly selected microphone is retried, not replaced"
-        );
-        assert_eq!(
-            recovery_action(VoiceRecoveryStage::FallbackRequired, false, false, false),
-            None,
-            "an explicitly selected microphone degrades instead of being replaced"
         );
         assert!(continue_without_voice(true, false));
         assert!(!continue_without_voice(false, false));
+    }
+
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn explicit_microphone_selection_reopens_exact_and_never_falls_back() {
+        let automatic_fallback_allowed =
+            automatic_microphone_fallback_allowed(Some("Logi Zone Wireless"));
+        assert!(!automatic_fallback_allowed);
+        assert!(!automatic_microphone_fallback_allowed(Some(
+            "device:AppleHDAEngineInput:1B,0,1,0:1"
+        )));
+        assert_eq!(
+            recovery_action(
+                VoiceRecoveryStage::ExactRetryAvailable,
+                true,
+                false,
+                automatic_fallback_allowed,
+            ),
+            Some(VoiceRecoveryAction::ReopenExact),
+            "a route change reopens the explicitly selected microphone"
+        );
+        assert_eq!(
+            recovery_action(
+                VoiceRecoveryStage::ExactRetryAvailable,
+                false,
+                false,
+                automatic_fallback_allowed,
+            ),
+            Some(VoiceRecoveryAction::ReopenExact),
+            "a health failure reopens the explicitly selected microphone"
+        );
+        assert_eq!(
+            recovery_action(
+                VoiceRecoveryStage::FallbackRequired,
+                false,
+                false,
+                automatic_fallback_allowed,
+            ),
+            None,
+            "an explicitly selected microphone degrades instead of being replaced"
+        );
     }
 
     #[cfg(feature = "streaming")]
