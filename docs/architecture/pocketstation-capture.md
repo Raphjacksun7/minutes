@@ -11,25 +11,16 @@ Minutes has two opt-in PocketStation integrations behind the
 In both cases the microphone and system/application audio remain independent
 stems. A microphone failure does not terminate a healthy system-audio stem.
 
-The macOS branch is development-only. It depends on PocketStation Core APIs
-that are present in the accepted local Core candidate but are not published in
-the `pocketstation` 1.1.10 crate. Local qualification therefore uses a Cargo
-patch to that exact Core checkout. Do not describe or release the macOS branch
-as an installable feature until those APIs have shipped in a new Core version
-and Minutes has updated its dependency to that release.
-
 ## Build Minutes
 
-For the published Windows/Linux application-capture path, enable the
-`pocketstation-capture` feature:
+Enable the `pocketstation-capture` feature:
 
 ```bash
 cargo build --release -p minutes-cli --features pocketstation-capture
 ```
 
-That path uses PocketStation 1.1.10 from crates.io and does not require a
-PocketStation source checkout. The current macOS microphone-supervision work
-cannot be built from crates.io alone for the reason above.
+The feature uses PocketStation 1.1.11 from crates.io and does not require a
+PocketStation source checkout.
 
 ## Windows and Linux: choose an application
 
