@@ -552,6 +552,7 @@ impl VoiceCaptureStream {
                         MicrophoneSignalState::NoFrames
                             | MicrophoneSignalState::Stalled
                             | MicrophoneSignalState::DigitallySilent
+                            | MicrophoneSignalState::SustainedLowSignal
                             | MicrophoneSignalState::NonFiniteSamples
                             | MicrophoneSignalState::SourceFailed
                     )
@@ -573,8 +574,7 @@ impl VoiceCaptureStream {
             #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
             Self::PocketStation(stream) => matches!(
                 stream.observations().state,
-                crate::pocketstation_microphone::MicrophoneSignalState::BelowThresholds
-                    | crate::pocketstation_microphone::MicrophoneSignalState::SignalObserved
+                crate::pocketstation_microphone::MicrophoneSignalState::SignalObserved
             ),
         }
     }
@@ -635,6 +635,9 @@ impl VoiceCaptureStream {
                 ),
                 MicrophoneSignalState::DigitallySilent => Some(
                     "The selected microphone is delivering digital silence. Minutes is retrying it while system audio continues.",
+                ),
+                MicrophoneSignalState::SustainedLowSignal => Some(
+                    "The selected microphone is delivering only sustained near-silence. Minutes is retrying it while system audio continues.",
                 ),
                 MicrophoneSignalState::NonFiniteSamples => Some(
                     "The selected microphone delivered invalid samples. Minutes is retrying it while system audio continues.",
@@ -724,16 +727,20 @@ fn recovery_action(
     stage: VoiceRecoveryStage,
     route_changed: bool,
     worker_failed: bool,
+    automatic_fallback_allowed: bool,
 ) -> Option<VoiceRecoveryAction> {
     match stage {
         VoiceRecoveryStage::ExactRetryAvailable if worker_failed => {
             Some(VoiceRecoveryAction::RestartWorker)
         }
-        VoiceRecoveryStage::ExactRetryAvailable if route_changed => {
+        VoiceRecoveryStage::ExactRetryAvailable if route_changed && automatic_fallback_allowed => {
             Some(VoiceRecoveryAction::ReplaceWithFallback)
         }
         VoiceRecoveryStage::ExactRetryAvailable => Some(VoiceRecoveryAction::ReopenExact),
-        VoiceRecoveryStage::FallbackRequired => Some(VoiceRecoveryAction::ReplaceWithFallback),
+        VoiceRecoveryStage::FallbackRequired if automatic_fallback_allowed => {
+            Some(VoiceRecoveryAction::ReplaceWithFallback)
+        }
+        VoiceRecoveryStage::FallbackRequired => None,
         VoiceRecoveryStage::FallbackExhausted => None,
     }
 }
@@ -1988,7 +1995,19 @@ fn record_to_wav_dual_source(
             let worker_failed = voice_stream
                 .as_ref()
                 .is_some_and(VoiceCaptureStream::worker_failed);
-            let action = recovery_action(voice_recovery_stage, voice_route_issue, worker_failed);
+            // An explicit microphone selection is an authorization boundary:
+            // retry that physical source once, but never substitute another
+            // microphone without a separate user opt-in. Following the system
+            // default retains Minutes' existing default-device fallback policy.
+            let automatic_fallback_allowed = plan.voice_override.is_none();
+            let fallback_withheld = voice_recovery_stage == VoiceRecoveryStage::FallbackRequired
+                && !automatic_fallback_allowed;
+            let action = recovery_action(
+                voice_recovery_stage,
+                voice_route_issue,
+                worker_failed,
+                automatic_fallback_allowed,
+            );
             let independent_failure = voice_stream
                 .as_ref()
                 .is_some_and(VoiceCaptureStream::independent_failure)
@@ -2067,9 +2086,24 @@ fn record_to_wav_dual_source(
                 }
                 None => {
                     minimum_voice_lineage = None;
-                    send_silence_notification_msg(
-                        "The microphone remained unusable after one exact retry and one explicit fallback. Minutes is continuing the healthy system-audio stem in degraded mode.",
-                    );
+                    voice_recovery_stage = VoiceRecoveryStage::FallbackExhausted;
+                    let message = if fallback_withheld {
+                        "The selected microphone remained unusable after one exact retry. Minutes will not replace an explicitly selected microphone without your approval, so the healthy system-audio stem is continuing in degraded mode. Choose another microphone to recover voice capture."
+                    } else {
+                        "The microphone remained unusable after one exact retry and one explicit fallback. Minutes is continuing the healthy system-audio stem in degraded mode."
+                    };
+                    eprintln!("[minutes] {message}");
+                    tracing::warn!(fallback_withheld, "{message}");
+                    if let Err(error) = crate::logging::append_log(&serde_json::json!({
+                        "ts": chrono::Local::now().to_rfc3339(),
+                        "level": "warn",
+                        "step": "microphone_recovery_degraded",
+                        "fallback_withheld": fallback_withheld,
+                        "message": message,
+                    })) {
+                        tracing::warn!(%error, "failed to persist microphone recovery diagnostic");
+                    }
+                    send_silence_notification_msg(message);
                 }
             }
 
@@ -4536,24 +4570,34 @@ mod tests {
     #[test]
     fn microphone_recovery_is_exact_once_then_fallback_once_then_degraded() {
         assert_eq!(
-            recovery_action(VoiceRecoveryStage::ExactRetryAvailable, false, false),
+            recovery_action(VoiceRecoveryStage::ExactRetryAvailable, false, false, true),
             Some(VoiceRecoveryAction::ReopenExact)
         );
         assert_eq!(
-            recovery_action(VoiceRecoveryStage::FallbackRequired, false, false),
+            recovery_action(VoiceRecoveryStage::FallbackRequired, false, false, true),
             Some(VoiceRecoveryAction::ReplaceWithFallback)
         );
         assert_eq!(
-            recovery_action(VoiceRecoveryStage::FallbackExhausted, false, false),
+            recovery_action(VoiceRecoveryStage::FallbackExhausted, false, false, true),
             None
         );
         assert_eq!(
-            recovery_action(VoiceRecoveryStage::FallbackExhausted, true, false),
+            recovery_action(VoiceRecoveryStage::FallbackExhausted, true, false, true),
             None
         );
         assert_eq!(
-            recovery_action(VoiceRecoveryStage::FallbackRequired, false, true),
+            recovery_action(VoiceRecoveryStage::FallbackRequired, false, true, true),
             Some(VoiceRecoveryAction::ReplaceWithFallback)
+        );
+        assert_eq!(
+            recovery_action(VoiceRecoveryStage::ExactRetryAvailable, true, false, false),
+            Some(VoiceRecoveryAction::ReopenExact),
+            "an explicitly selected microphone is retried, not replaced"
+        );
+        assert_eq!(
+            recovery_action(VoiceRecoveryStage::FallbackRequired, false, false, false),
+            None,
+            "an explicitly selected microphone degrades instead of being replaced"
         );
         assert!(continue_without_voice(true, false));
         assert!(!continue_without_voice(false, false));

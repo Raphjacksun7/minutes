@@ -98,21 +98,36 @@ callback. Minutes distinguishes these conditions:
 - frames stopped arriving;
 - frames are arriving but remain exact digital zero;
 - the measured signal is below the configured peak/RMS thresholds;
+- nonzero input remains below the separate near-silence failure envelope for
+  the bounded recovery window;
 - useful signal was observed;
 - samples were non-finite; or
 - the source failed.
 
 For a recoverable microphone failure, Minutes requests one bounded reopen of
-the exact selected device. If that reopen fails, or if the reopened device is
-still unhealthy after the observation window, Minutes resolves an explicit
-fallback device ID and asks PocketStation to replace the source. It uses the
-current default when that is a different physical device; otherwise it prefers
-an available built-in/internal input before another alternative. One fallback
-is attempted. If it also remains unhealthy, Minutes continues in system-only
-degraded mode instead of looping forever. A replacement carries a new source
-generation and discontinuity instead of pretending that two physical devices
-are one uninterrupted source. While the microphone is unavailable, the system
-stem continues and missing voice slots are represented as silence.
+the exact selected device. When the recording follows the system default and
+that reopen fails, or the reopened device remains unhealthy, Minutes resolves
+one explicit fallback device ID and asks PocketStation to replace the source.
+It uses the current default when that is a different physical device;
+otherwise it prefers an available built-in/internal input before another
+alternative. If the user explicitly selected a microphone, Minutes never
+substitutes another physical device automatically: after the exact retry it
+continues system-only and tells the user to choose another microphone. This
+prevents a hardware-muted or intentionally selected headset from being
+silently replaced by an active built-in microphone.
+
+One fallback is attempted for default-following capture. If it also remains
+unhealthy, Minutes continues in system-only degraded mode instead of looping
+forever. A replacement carries a new source generation and discontinuity
+instead of pretending that two physical devices are one uninterrupted source.
+While the microphone is unavailable, the system stem continues and missing
+voice slots are represented as silence.
+
+The near-silence failure envelope is deliberately much lower than the ordinary
+signal threshold. It requires both peak at or below -70 dBFS and RMS at or
+below -80 dBFS for 1.5 seconds. This covers #1057's measured -78.3 dBFS peak
+and -91 dBFS mean level without treating ordinary quiet speech as a failed
+device.
 
 This is host policy, not automatic Core policy: PocketStation supplies the
 measurements, explicit reopen/replacement operations, lineage, and bounded
@@ -151,6 +166,11 @@ worker converts canonical 48 kHz audio to the 16 kHz format used by Minutes and
 groups it into 100 ms chunks. PocketStation opens supported native microphone
 formats and performs conversion/resampling before delivering those canonical
 frames; Minutes exposes the actual opened format in its observations.
+On each successful physical attachment, Minutes also writes one content-free
+`pocketstation_microphone_opened_format` record to
+`~/.minutes/logs/minutes.log` and prints the rate, channel count, and sample
+representation to stderr. The record contains device/format and continuity
+facts, never PCM samples.
 
 Each PocketStation path uses a bounded 64-chunk output queue, which is 6.4
 seconds at this format. If the recording loop cannot keep up, new chunks are

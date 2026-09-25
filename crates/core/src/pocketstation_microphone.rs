@@ -3,8 +3,8 @@ use crate::streaming::{AudioChunk, AudioChunkLineage, ChunkAccumulator, SourceRo
 use pocketstation::{
     AudioFrameDuration, CaptureNativeFormat, DeviceId, DeviceSelector, Session, SessionEventKind,
     SessionSourceActivityObservations, SessionSourceActivityPolicy, SessionSourceActivityState,
-    SessionSourceReplacement, SessionSourceSignalObservations, SessionSourceSignalPolicy,
-    SessionSourceSignalState, Source, SourceKind, StemId,
+    SessionSourceReplacement, SessionSourceSignalEvaluation, SessionSourceSignalObservations,
+    SessionSourceSignalPolicy, SessionSourceSignalState, Source, SourceKind, StemId,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +19,13 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const EXACT_ZERO_TIMEOUT: Duration = Duration::from_millis(1_500);
 const MINIMUM_PEAK_DBFS: f64 = -45.0;
 const MINIMUM_RMS_DBFS: f64 = -55.0;
+// #1057's failed Logi HFP stem was not bit-exact zero: its measured peak was
+// -78.3 dBFS and its mean level was -91 dBFS. Keep this failure threshold well
+// below ordinary quiet speech, and require it to persist before asking the host
+// to recover the source.
+const UNUSABLE_LOW_SIGNAL_MAXIMUM_PEAK_DBFS: f64 = -70.0;
+const UNUSABLE_LOW_SIGNAL_MAXIMUM_RMS_DBFS: f64 = -80.0;
+const UNUSABLE_LOW_SIGNAL_TIMEOUT: Duration = Duration::from_millis(1_500);
 const OUTPUT_QUEUE_CAPACITY_CHUNKS: usize = 64;
 const CONTROL_QUEUE_CAPACITY: usize = 4;
 const POCKETSTATION_SAMPLE_RATE_HZ: u32 = 48_000;
@@ -38,6 +45,7 @@ pub(crate) enum MicrophoneSignalState {
     ExactDigitalZeroPending,
     DigitallySilent,
     BelowThresholds,
+    SustainedLowSignal,
     SignalObserved,
     NonFiniteSamples,
     SourceFailed,
@@ -49,6 +57,8 @@ pub(crate) struct MicrophoneObservations {
     pub(crate) native_format: Option<CaptureNativeFormat>,
     pub(crate) activity: Option<SessionSourceActivityObservations>,
     pub(crate) signal: Option<SessionSourceSignalObservations>,
+    pub(crate) source_generation: u32,
+    pub(crate) discontinuity_epoch: u64,
 }
 
 impl Default for MicrophoneObservations {
@@ -58,7 +68,47 @@ impl Default for MicrophoneObservations {
             native_format: None,
             activity: None,
             signal: None,
+            source_generation: 1,
+            discontinuity_epoch: 0,
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct LowSignalTracker {
+    started_at_ns: Option<u64>,
+    source_generation: u32,
+    discontinuity_epoch: u64,
+}
+
+impl LowSignalTracker {
+    fn observe(
+        &mut self,
+        observed_at_ns: u64,
+        source_generation: u32,
+        discontinuity_epoch: u64,
+        peak_dbfs: Option<f64>,
+        rms_dbfs: Option<f64>,
+    ) -> bool {
+        let source_changed = self.source_generation != source_generation
+            || self.discontinuity_epoch != discontinuity_epoch;
+        let unusably_low = peak_dbfs.is_some_and(|peak| {
+            peak <= UNUSABLE_LOW_SIGNAL_MAXIMUM_PEAK_DBFS
+                && rms_dbfs.is_some_and(|rms| rms <= UNUSABLE_LOW_SIGNAL_MAXIMUM_RMS_DBFS)
+        });
+
+        if source_changed || !unusably_low {
+            self.started_at_ns = None;
+            self.source_generation = source_generation;
+            self.discontinuity_epoch = discontinuity_epoch;
+        }
+        if !unusably_low {
+            return false;
+        }
+
+        let started_at_ns = *self.started_at_ns.get_or_insert(observed_at_ns);
+        observed_at_ns.saturating_sub(started_at_ns)
+            >= UNUSABLE_LOW_SIGNAL_TIMEOUT.as_nanos() as u64
     }
 }
 
@@ -186,13 +236,30 @@ fn choose_recovery_fallback(
     alternatives.into_iter().next()
 }
 
+#[derive(Clone)]
+struct MicrophoneDiagnosticIdentity {
+    device_id: String,
+    display_name: String,
+}
+
+impl From<&MicrophoneSelection> for MicrophoneDiagnosticIdentity {
+    fn from(selection: &MicrophoneSelection) -> Self {
+        Self {
+            device_id: selection.device_id.clone(),
+            display_name: selection.display_name.clone(),
+        }
+    }
+}
+
 enum MicrophoneControl {
     Reopen {
         selector: DeviceSelector,
+        identity: MicrophoneDiagnosticIdentity,
         response: crossbeam_channel::Sender<Result<SessionSourceReplacement, String>>,
     },
     Replace {
         selector: DeviceSelector,
+        identity: MicrophoneDiagnosticIdentity,
         response: crossbeam_channel::Sender<Result<SessionSourceReplacement, String>>,
     },
 }
@@ -237,6 +304,7 @@ impl PocketStationMicrophoneStream {
     }
 
     fn start_selection(selection: MicrophoneSelection) -> Result<Self, CaptureError> {
+        let diagnostic_identity = MicrophoneDiagnosticIdentity::from(&selection);
         let session = Session::builder()
             .audio_frame_duration(AudioFrameDuration::Ms10)
             .build();
@@ -277,6 +345,7 @@ impl PocketStationMicrophoneStream {
             Arc::clone(&source_failed),
             Arc::clone(&dropped_chunks_total),
             Arc::clone(&observations),
+            diagnostic_identity,
             worker_finished_sender,
         )?;
 
@@ -310,6 +379,7 @@ impl PocketStationMicrophoneStream {
         source_failed: Arc<AtomicBool>,
         dropped_chunks_total: Arc<AtomicU64>,
         observations: Arc<Mutex<MicrophoneObservations>>,
+        diagnostic_identity: MicrophoneDiagnosticIdentity,
         worker_finished: crossbeam_channel::Sender<()>,
     ) -> Result<JoinHandle<()>, CaptureError> {
         std::thread::Builder::new()
@@ -327,24 +397,46 @@ impl PocketStationMicrophoneStream {
                 )
                 .expect("fixed microphone signal policy must be valid");
                 let mut writer = MicrophoneAudioChunkWriter::default();
+                let mut low_signal_tracker = LowSignalTracker::default();
+                let mut diagnostic_identity = diagnostic_identity;
+                let mut logged_native_format_attachment = None;
+                let mut pending_format_continuity = None;
 
                 while !stop.load(Ordering::Relaxed) {
                     while let Ok(command) = control.try_recv() {
                         source_failed.store(false, Ordering::Relaxed);
-                        let (result, response) = match command {
-                            MicrophoneControl::Reopen { selector, response } => (
+                        let (result, identity, response) = match command {
+                            MicrophoneControl::Reopen {
+                                selector,
+                                identity,
+                                response,
+                            } => (
                                 running
                                     .reopen_microphone_source(stem_id, selector)
                                     .map_err(|error| error.to_string()),
+                                identity,
                                 response,
                             ),
-                            MicrophoneControl::Replace { selector, response } => (
+                            MicrophoneControl::Replace {
+                                selector,
+                                identity,
+                                response,
+                            } => (
                                 running
                                     .replace_microphone_source(stem_id, selector)
                                     .map_err(|error| error.to_string()),
+                                identity,
                                 response,
                             ),
                         };
+                        if let Ok(replacement) = &result {
+                            diagnostic_identity = identity;
+                            logged_native_format_attachment = None;
+                            pending_format_continuity = Some((
+                                replacement.source_generation,
+                                replacement.discontinuity_epoch,
+                            ));
+                        }
                         writer.reset_for_discontinuity();
                         let _ = response.try_send(result);
                     }
@@ -423,14 +515,24 @@ impl PocketStationMicrophoneStream {
                         }
                     }
 
-                    update_observations(
+                    if let Some(current_observations) = update_observations(
                         &running,
                         stem_id,
                         activity_policy,
                         signal_policy,
+                        &mut low_signal_tracker,
                         source_failed.load(Ordering::Relaxed),
                         &observations,
-                    );
+                    ) {
+                        if report_opened_native_format_once(
+                            current_observations,
+                            &diagnostic_identity,
+                            pending_format_continuity,
+                            &mut logged_native_format_attachment,
+                        ) {
+                            pending_format_continuity = None;
+                        }
+                    }
                     if failed.load(Ordering::Relaxed) {
                         break;
                     }
@@ -465,6 +567,10 @@ impl PocketStationMicrophoneStream {
     pub(crate) fn reopen_exact(&self) -> Result<SessionSourceReplacement, CaptureError> {
         self.request_control(|response| MicrophoneControl::Reopen {
             selector: self.selector.clone(),
+            identity: MicrophoneDiagnosticIdentity {
+                device_id: self.device_id.clone(),
+                display_name: self.device_name.clone(),
+            },
             response,
         })
     }
@@ -478,6 +584,7 @@ impl PocketStationMicrophoneStream {
         let selector = selection.selector.clone();
         let result = self.request_control(|response| MicrophoneControl::Replace {
             selector: selector.clone(),
+            identity: MicrophoneDiagnosticIdentity::from(&selection),
             response,
         })?;
         self.selector = selector;
@@ -557,60 +664,118 @@ fn update_observations(
     stem_id: StemId,
     activity_policy: SessionSourceActivityPolicy,
     signal_policy: SessionSourceSignalPolicy,
+    low_signal_tracker: &mut LowSignalTracker,
     source_failed: bool,
     observations: &Mutex<MicrophoneObservations>,
-) {
+) -> Option<MicrophoneObservations> {
     let Ok(snapshot) = running.metrics_snapshot() else {
-        return;
+        return None;
     };
     let Some(source_index) = (0..snapshot.source_count()).find(|&index| {
         snapshot
             .source(index)
             .is_some_and(|source| source.stem_id == stem_id)
     }) else {
-        return;
+        return None;
     };
     let activity = snapshot.source_activity(source_index).copied();
     let signal = snapshot.source_signal(source_index).copied();
+    let replacement = snapshot.source_replacement(source_index).copied();
     let native_format = snapshot
         .source_native_format(source_index)
         .and_then(|entry| entry.opened_native_format);
-    let state = evaluate_state(
+    let source_generation = replacement.map_or(1, |entry| entry.source_generation);
+    let discontinuity_epoch = replacement.map_or(0, |entry| entry.discontinuity_epoch);
+    let state = evaluate_observations(
         activity,
         signal,
         activity_policy,
         signal_policy,
+        low_signal_tracker,
+        source_generation,
+        discontinuity_epoch,
         source_failed,
     );
+    let observation_snapshot = MicrophoneObservations {
+        state,
+        native_format,
+        activity,
+        signal,
+        source_generation,
+        discontinuity_epoch,
+    };
     if let Ok(mut current) = observations.lock() {
-        *current = MicrophoneObservations {
-            state,
-            native_format,
-            activity,
-            signal,
-        };
+        *current = observation_snapshot;
     }
+    Some(observation_snapshot)
 }
 
-fn evaluate_state(
+fn evaluate_observations(
     activity: Option<SessionSourceActivityObservations>,
     signal: Option<SessionSourceSignalObservations>,
     activity_policy: SessionSourceActivityPolicy,
     signal_policy: SessionSourceSignalPolicy,
+    low_signal_tracker: &mut LowSignalTracker,
+    source_generation: u32,
+    discontinuity_epoch: u64,
+    source_failed: bool,
+) -> MicrophoneSignalState {
+    let activity_state = activity.map(|activity| activity.evaluate(activity_policy).state);
+    let signal_evaluation = signal.map(|signal| signal.evaluate(signal_policy));
+    evaluate_state(
+        activity_state,
+        signal_evaluation,
+        signal.map_or_else(
+            || activity.map_or(0, |entry| entry.observed_at_ns),
+            |entry| entry.observed_at_ns,
+        ),
+        low_signal_tracker,
+        source_generation,
+        discontinuity_epoch,
+        source_failed,
+    )
+}
+
+fn evaluate_state(
+    activity_state: Option<SessionSourceActivityState>,
+    signal_evaluation: Option<SessionSourceSignalEvaluation>,
+    observed_at_ns: u64,
+    low_signal_tracker: &mut LowSignalTracker,
+    source_generation: u32,
+    discontinuity_epoch: u64,
     source_failed: bool,
 ) -> MicrophoneSignalState {
     if source_failed {
+        low_signal_tracker.started_at_ns = None;
         return MicrophoneSignalState::SourceFailed;
     }
+    let sustained_low_signal = signal_evaluation.is_some_and(|evaluation| {
+        evaluation.state == SessionSourceSignalState::BelowCallerThresholds
+            && low_signal_tracker.observe(
+                observed_at_ns,
+                source_generation,
+                discontinuity_epoch,
+                evaluation.peak_dbfs,
+                evaluation.rms_dbfs,
+            )
+    });
+    if !matches!(
+        signal_evaluation,
+        Some(evaluation) if evaluation.state == SessionSourceSignalState::BelowCallerThresholds
+    ) {
+        low_signal_tracker.started_at_ns = None;
+    }
     classify_evaluations(
-        activity.map(|activity| activity.evaluate(activity_policy).state),
-        signal.map(|signal| signal.evaluate(signal_policy).state),
+        activity_state,
+        signal_evaluation.map(|evaluation| evaluation.state),
+        sustained_low_signal,
     )
 }
 
 fn classify_evaluations(
     activity: Option<SessionSourceActivityState>,
     signal: Option<SessionSourceSignalState>,
+    sustained_low_signal: bool,
 ) -> MicrophoneSignalState {
     match activity {
         None | Some(SessionSourceActivityState::AwaitingFirstFrame) => {
@@ -632,6 +797,9 @@ fn classify_evaluations(
         Some(SessionSourceSignalState::SustainedExactDigitalZero) => {
             MicrophoneSignalState::DigitallySilent
         }
+        Some(SessionSourceSignalState::BelowCallerThresholds) if sustained_low_signal => {
+            MicrophoneSignalState::SustainedLowSignal
+        }
         Some(SessionSourceSignalState::BelowCallerThresholds) => {
             MicrophoneSignalState::BelowThresholds
         }
@@ -642,6 +810,75 @@ fn classify_evaluations(
             MicrophoneSignalState::NonFiniteSamples
         }
     }
+}
+
+fn report_opened_native_format_once(
+    observations: MicrophoneObservations,
+    identity: &MicrophoneDiagnosticIdentity,
+    minimum_continuity: Option<(u32, u64)>,
+    logged: &mut Option<(u32, String)>,
+) -> bool {
+    if minimum_continuity.is_some_and(|minimum| {
+        (
+            observations.source_generation,
+            observations.discontinuity_epoch,
+        ) < minimum
+    }) {
+        return false;
+    }
+    let Some(native_format) = observations.native_format else {
+        return false;
+    };
+    let key = opened_native_format_diagnostic_key(observations, identity);
+    if logged.as_ref() == Some(&key) {
+        return false;
+    }
+
+    let entry = opened_native_format_log_entry(
+        identity,
+        native_format,
+        observations.source_generation,
+        observations.discontinuity_epoch,
+    );
+    eprintln!(
+        "[minutes] PocketStation microphone opened: {} Hz, {} channel(s), {:?}",
+        native_format.sample_rate_hz,
+        native_format.channel_count,
+        native_format.sample_representation
+    );
+    if let Err(error) = crate::logging::append_log(&entry) {
+        tracing::warn!(%error, "failed to persist PocketStation microphone format diagnostic");
+    }
+    *logged = Some(key);
+    true
+}
+
+fn opened_native_format_diagnostic_key(
+    observations: MicrophoneObservations,
+    identity: &MicrophoneDiagnosticIdentity,
+) -> (u32, String) {
+    (observations.source_generation, identity.device_id.clone())
+}
+
+fn opened_native_format_log_entry(
+    identity: &MicrophoneDiagnosticIdentity,
+    native_format: CaptureNativeFormat,
+    source_generation: u32,
+    discontinuity_epoch: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ts": chrono::Local::now().to_rfc3339(),
+        "level": "info",
+        "step": "pocketstation_microphone_opened_format",
+        "device_id": identity.device_id,
+        "device_name": identity.display_name,
+        "sample_rate_hz": native_format.sample_rate_hz,
+        "channel_count": native_format.channel_count,
+        "sample_representation": format!("{:?}", native_format.sample_representation),
+        "source_generation": source_generation,
+        "discontinuity_epoch": discontinuity_epoch,
+        "message": "PocketStation microphone opened a native input format",
+    })
 }
 
 #[derive(Default)]
@@ -948,28 +1185,35 @@ mod tests {
     #[test]
     fn activity_facts_distinguish_waiting_no_frames_active_and_stalled() {
         let (activity_policy, signal_policy) = policies();
+        let mut low_signal_tracker = LowSignalTracker::default();
         assert_eq!(
-            evaluate_state(
+            evaluate_observations(
                 Some(activity(1_000_000_000, None, None)),
                 None,
                 activity_policy,
                 signal_policy,
+                &mut low_signal_tracker,
+                1,
+                0,
                 false,
             ),
             MicrophoneSignalState::AwaitingFirstFrame
         );
         assert_eq!(
-            evaluate_state(
+            evaluate_observations(
                 Some(activity(3_000_000_000, None, None)),
                 None,
                 activity_policy,
                 signal_policy,
+                &mut low_signal_tracker,
+                1,
+                0,
                 false,
             ),
             MicrophoneSignalState::NoFrames
         );
         assert_eq!(
-            evaluate_state(
+            evaluate_observations(
                 Some(activity(
                     1_500_000_000,
                     Some(500_000_000),
@@ -978,12 +1222,15 @@ mod tests {
                 None,
                 activity_policy,
                 signal_policy,
+                &mut low_signal_tracker,
+                1,
+                0,
                 false,
             ),
             MicrophoneSignalState::Active
         );
         assert_eq!(
-            evaluate_state(
+            evaluate_observations(
                 Some(activity(
                     4_000_000_000,
                     Some(500_000_000),
@@ -992,6 +1239,9 @@ mod tests {
                 None,
                 activity_policy,
                 signal_policy,
+                &mut low_signal_tracker,
+                1,
+                0,
                 false,
             ),
             MicrophoneSignalState::Stalled
@@ -1001,8 +1251,18 @@ mod tests {
     #[test]
     fn source_failure_is_not_relabelled_as_silence() {
         let (activity_policy, signal_policy) = policies();
+        let mut low_signal_tracker = LowSignalTracker::default();
         assert_eq!(
-            evaluate_state(None, None, activity_policy, signal_policy, true),
+            evaluate_observations(
+                None,
+                None,
+                activity_policy,
+                signal_policy,
+                &mut low_signal_tracker,
+                1,
+                0,
+                true,
+            ),
             MicrophoneSignalState::SourceFailed
         );
     }
@@ -1070,6 +1330,7 @@ mod tests {
             classify_evaluations(
                 Some(SessionSourceActivityState::Active),
                 Some(SessionSourceSignalState::SustainedExactDigitalZero),
+                false,
             ),
             MicrophoneSignalState::DigitallySilent
         );
@@ -1077,8 +1338,142 @@ mod tests {
             classify_evaluations(
                 Some(SessionSourceActivityState::Active),
                 Some(SessionSourceSignalState::MeetsCallerThresholds),
+                false,
             ),
             MicrophoneSignalState::SignalObserved
+        );
+    }
+
+    #[test]
+    fn reported_hfp_noise_envelope_requires_bounded_low_signal_recovery() {
+        let mut tracker = LowSignalTracker::default();
+        let timeout_ns = UNUSABLE_LOW_SIGNAL_TIMEOUT.as_nanos() as u64;
+
+        assert!(!tracker.observe(1, 1, 0, Some(-78.3), Some(-91.0)));
+        assert!(!tracker.observe(timeout_ns, 1, 0, Some(-78.3), Some(-91.0)));
+        assert!(tracker.observe(timeout_ns + 1, 1, 0, Some(-78.3), Some(-91.0)));
+
+        // Ordinary quiet audio and a new physical source both reset the
+        // bounded interval rather than inheriting an earlier failure.
+        assert!(!tracker.observe(timeout_ns + 2, 1, 0, Some(-60.0), Some(-68.0)));
+        assert!(!tracker.observe(timeout_ns * 3, 2, 1, Some(-78.3), Some(-91.0)));
+    }
+
+    #[test]
+    fn reported_hfp_envelope_transitions_only_after_timeout_and_resets_on_source_change() {
+        let mut tracker = LowSignalTracker::default();
+        let timeout_ns = UNUSABLE_LOW_SIGNAL_TIMEOUT.as_nanos() as u64;
+        let low_signal = Some(SessionSourceSignalEvaluation {
+            state: SessionSourceSignalState::BelowCallerThresholds,
+            peak_dbfs: Some(-78.3),
+            rms_dbfs: Some(-91.0),
+            consecutive_exact_zero_duration_ns: 0,
+        });
+        let evaluate =
+            |observed_at_ns, generation, discontinuity, tracker: &mut LowSignalTracker| {
+                evaluate_state(
+                    Some(SessionSourceActivityState::Active),
+                    low_signal,
+                    observed_at_ns,
+                    tracker,
+                    generation,
+                    discontinuity,
+                    false,
+                )
+            };
+
+        assert_eq!(
+            evaluate(1, 1, 0, &mut tracker),
+            MicrophoneSignalState::BelowThresholds
+        );
+        assert_eq!(
+            evaluate(timeout_ns, 1, 0, &mut tracker),
+            MicrophoneSignalState::BelowThresholds
+        );
+        assert_eq!(
+            evaluate(timeout_ns + 1, 1, 0, &mut tracker),
+            MicrophoneSignalState::SustainedLowSignal
+        );
+
+        assert_eq!(
+            evaluate(timeout_ns * 3, 2, 0, &mut tracker),
+            MicrophoneSignalState::BelowThresholds,
+            "a new source generation starts a new bounded interval"
+        );
+        assert_eq!(
+            evaluate(timeout_ns * 5, 2, 1, &mut tracker),
+            MicrophoneSignalState::BelowThresholds,
+            "a discontinuity starts a new bounded interval"
+        );
+    }
+
+    #[test]
+    fn opened_format_diagnostic_is_content_free_and_names_the_physical_format() {
+        let identity = MicrophoneDiagnosticIdentity {
+            device_id: "device-uid".to_owned(),
+            display_name: "Logi HFP".to_owned(),
+        };
+        let native_format = CaptureNativeFormat {
+            sample_rate_hz: 16_000,
+            channel_count: 1,
+            sample_representation: pocketstation::CaptureSampleRepresentation::SignedInteger16,
+        };
+        let entry = opened_native_format_log_entry(&identity, native_format, 2, 1);
+
+        assert_eq!(entry["step"], "pocketstation_microphone_opened_format");
+        assert_eq!(entry["device_id"], "device-uid");
+        assert_eq!(entry["sample_rate_hz"], 16_000);
+        assert_eq!(entry["channel_count"], 1);
+        assert_eq!(entry["sample_representation"], "SignedInteger16");
+        assert_eq!(entry["source_generation"], 2);
+        assert_eq!(entry["discontinuity_epoch"], 1);
+        assert!(entry.get("samples").is_none());
+        assert!(entry.get("audio").is_none());
+
+        let observations = MicrophoneObservations {
+            native_format: Some(native_format),
+            source_generation: 2,
+            discontinuity_epoch: 1,
+            ..MicrophoneObservations::default()
+        };
+        let key = opened_native_format_diagnostic_key(observations, &identity);
+        assert_eq!(
+            opened_native_format_diagnostic_key(observations, &identity),
+            key.clone(),
+            "unchanged observations are de-duplicated by the same key"
+        );
+        assert_eq!(
+            opened_native_format_diagnostic_key(
+                MicrophoneObservations {
+                    discontinuity_epoch: 2,
+                    ..observations
+                },
+                &identity,
+            ),
+            key.clone(),
+            "a discontinuity alone does not duplicate the attachment diagnostic"
+        );
+        assert_ne!(
+            opened_native_format_diagnostic_key(
+                MicrophoneObservations {
+                    source_generation: 3,
+                    ..observations
+                },
+                &identity,
+            ),
+            key.clone(),
+            "a new source generation gets one new diagnostic"
+        );
+        assert_ne!(
+            opened_native_format_diagnostic_key(
+                observations,
+                &MicrophoneDiagnosticIdentity {
+                    device_id: "fallback-uid".to_owned(),
+                    display_name: "Built-in Microphone".to_owned(),
+                },
+            ),
+            key,
+            "a different physical device gets one new diagnostic"
         );
     }
 
