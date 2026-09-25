@@ -855,7 +855,10 @@ fn recovery_action(
     }
 }
 
-#[cfg(feature = "streaming")]
+#[cfg(all(
+    feature = "streaming",
+    any(test, all(feature = "pocketstation-capture", target_os = "macos"))
+))]
 fn recovery_lineage_floor(
     action: VoiceRecoveryAction,
     replacement_pending: bool,
