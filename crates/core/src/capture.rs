@@ -483,6 +483,15 @@ enum VoiceRecoveryStage {
 
 #[cfg(feature = "streaming")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MicrophoneDegradedReason {
+    ExplicitSelection,
+    DefaultUnchanged,
+    ChangedDefaultAttachFailed,
+    FallbackExhausted,
+}
+
+#[cfg(feature = "streaming")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VoiceLineageFloor {
     source_generation: u32,
     discontinuity_epoch: u64,
@@ -828,6 +837,24 @@ fn should_report_low_signal(
     }
     *reported_continuity = Some(continuity);
     true
+}
+
+#[cfg(feature = "streaming")]
+fn microphone_degraded_message(reason: MicrophoneDegradedReason) -> &'static str {
+    match reason {
+        MicrophoneDegradedReason::ExplicitSelection => {
+            "The selected microphone remained unusable after one exact retry. Minutes will not replace an explicitly selected microphone without your approval, so system audio will continue without microphone audio. Stop this recording, choose another microphone, then start a new recording."
+        }
+        MicrophoneDegradedReason::DefaultUnchanged => {
+            "The microphone remained unusable after one exact retry, and the system default still resolves to the same physical input. Minutes will continue without microphone audio. Stop this recording, change the system default or choose another microphone, then start a new recording."
+        }
+        MicrophoneDegradedReason::ChangedDefaultAttachFailed => {
+            "Minutes detected a changed system-default microphone, but attaching that input failed. System audio will continue without microphone audio. Stop this recording, correct or select the microphone, then start a new recording."
+        }
+        MicrophoneDegradedReason::FallbackExhausted => {
+            "The microphone remained unusable after one exact retry and one changed-default attachment attempt. Minutes will continue without microphone audio. Stop this recording, correct or select the microphone, then start a new recording."
+        }
+    }
 }
 
 #[cfg(feature = "streaming")]
@@ -2178,12 +2205,14 @@ fn record_to_wav_dual_source(
                         "bounded voice recovery failed — continuing with the unaffected system stem"
                     );
                     if action == Some(VoiceRecoveryAction::ReplaceWithFallback) {
-                        let message = "The microphone remained unusable and the system default did not provide a different input. Minutes is continuing system audio only. Choose another microphone or change the system default to recover voice capture.";
+                        let message = microphone_degraded_message(
+                            MicrophoneDegradedReason::ChangedDefaultAttachFailed,
+                        );
                         eprintln!("[minutes] {message}");
                         if let Err(log_error) = crate::logging::append_log(&serde_json::json!({
                             "ts": chrono::Local::now().to_rfc3339(),
                             "level": "warn",
-                            "step": "microphone_default_fallback_unavailable",
+                            "step": "microphone_changed_default_attach_failed",
                             "message": message,
                             "error": error.to_string(),
                         })) {
@@ -2208,13 +2237,14 @@ fn record_to_wav_dual_source(
                 None => {
                     minimum_voice_lineage = None;
                     voice_recovery_stage = VoiceRecoveryStage::FallbackExhausted;
-                    let message = if fallback_withheld && !selection_allows_automatic_fallback {
-                        "The selected microphone remained unusable after one exact retry. Minutes will not replace an explicitly selected microphone without your approval, so the healthy system-audio stem is continuing in degraded mode. Choose another microphone to recover voice capture."
+                    let reason = if fallback_withheld && !selection_allows_automatic_fallback {
+                        MicrophoneDegradedReason::ExplicitSelection
                     } else if fallback_withheld {
-                        "The microphone remained unusable after one exact retry, and the system default still resolves to the same physical input. Minutes is continuing system audio only. Choose another microphone or change the system default to recover voice capture."
+                        MicrophoneDegradedReason::DefaultUnchanged
                     } else {
-                        "The microphone remained unusable after one exact retry and one explicit fallback. Minutes is continuing the healthy system-audio stem in degraded mode."
+                        MicrophoneDegradedReason::FallbackExhausted
                     };
+                    let message = microphone_degraded_message(reason);
                     eprintln!("[minutes] {message}");
                     tracing::warn!(fallback_withheld, "{message}");
                     if let Err(error) = crate::logging::append_log(&serde_json::json!({
@@ -4837,6 +4867,28 @@ mod tests {
                 ..notice
             }
         ));
+    }
+
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn terminal_microphone_degradation_requires_a_new_recording() {
+        for reason in [
+            MicrophoneDegradedReason::ExplicitSelection,
+            MicrophoneDegradedReason::DefaultUnchanged,
+            MicrophoneDegradedReason::ChangedDefaultAttachFailed,
+            MicrophoneDegradedReason::FallbackExhausted,
+        ] {
+            let message = microphone_degraded_message(reason);
+            assert!(message.contains("Stop this recording"));
+            assert!(message.contains("start a new recording"));
+            assert!(!message.contains("recover voice capture"));
+        }
+
+        let changed_default =
+            microphone_degraded_message(MicrophoneDegradedReason::ChangedDefaultAttachFailed);
+        assert!(changed_default.contains("changed system-default microphone"));
+        assert!(changed_default.contains("attaching that input failed"));
+        assert!(!changed_default.contains("did not provide a different input"));
     }
 
     #[cfg(feature = "streaming")]

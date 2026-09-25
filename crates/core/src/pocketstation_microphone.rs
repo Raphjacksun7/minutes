@@ -182,7 +182,7 @@ impl MicrophoneSelection {
         choose_recovery_fallback(current_device_id, default).ok_or_else(|| {
             capture_error(
                 "select PocketStation microphone fallback",
-                "the system default input still resolves to the failed microphone; choose another microphone to continue voice capture",
+                "the system default input still resolves to the failed microphone; stop this recording, change or select the microphone, then start a new recording",
             )
         })
     }

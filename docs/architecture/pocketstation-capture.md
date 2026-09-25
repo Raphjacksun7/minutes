@@ -110,20 +110,23 @@ that reopen fails, or the reopened device remains unhealthy, Minutes resolves
 one explicit fallback device ID and asks PocketStation to replace the source.
 It follows the current OS default only when that default resolves to a
 different physical device. If the default still resolves to the failed
-microphone, Minutes continues system-only and asks the user to choose another
-input instead of inventing an arbitrary built-in fallback. If the user
-explicitly selected a microphone, Minutes never
-substitutes another physical device automatically: after the exact retry it
-continues system-only and tells the user to choose another microphone. This
-prevents a hardware-muted or intentionally selected headset from being
-silently replaced by an active built-in microphone.
+microphone, Minutes continues system-only instead of inventing an arbitrary
+built-in fallback. The user must stop the recording, change or select the
+microphone, and start a new recording. If the user explicitly selected a
+microphone, Minutes never substitutes another physical device automatically:
+after the exact retry it continues system-only with the same stop/change/start
+guidance. This prevents a hardware-muted or intentionally selected headset
+from being silently replaced by an active built-in microphone.
 
 One fallback is attempted for default-following capture. If it also remains
 unhealthy, Minutes continues in system-only degraded mode instead of looping
-forever. A replacement carries a new source generation and discontinuity
-instead of pretending that two physical devices are one uninterrupted source.
-While the microphone is unavailable, the system stem continues and missing
-voice slots are represented as silence.
+forever. If attaching a changed default fails, Minutes reports that attachment
+failure directly. Terminal degraded mode does not live-rearm microphone
+capture: recovery requires stopping this recording and starting a new one
+after correcting the input. A replacement carries a new source generation and
+discontinuity instead of pretending that two physical devices are one
+uninterrupted source. While the microphone is unavailable, the system stem
+continues and missing voice slots are represented as silence.
 
 The near-silence observation envelope is deliberately much lower than the
 ordinary signal threshold. It requires both peak at or below -70 dBFS and RMS
