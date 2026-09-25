@@ -1,453 +1,59 @@
+mod chunks;
+mod health;
+mod recovery;
+mod selection;
+
+use self::chunks::MicrophoneAudioChunkWriter;
+#[cfg(test)]
+use self::chunks::{
+    contiguous_source_interval, deliver_chunk, merge_source_interval, missing_source_frames,
+    same_source_interval, MAX_SEQUENCE_GAP_DURATION, SOURCE_FRAME_DURATION_NS,
+    SOURCE_FRAME_SAMPLES,
+};
+#[cfg(test)]
+use self::health::{
+    classify_evaluations, evaluate_state, LowSignalTracker, ObservationContinuityTracker,
+    SignalWindowContinuity, UNUSABLE_LOW_SIGNAL_TIMEOUT,
+};
+use self::health::{
+    MicrophoneObservationEvaluator, EXACT_ZERO_TIMEOUT, FIRST_FRAME_TIMEOUT, MINIMUM_PEAK_DBFS,
+    MINIMUM_RMS_DBFS, STALL_TIMEOUT,
+};
+pub(crate) use self::health::{MicrophoneObservations, MicrophoneSignalState};
+#[cfg(test)]
+use self::recovery::MicrophoneReplacementOutcome;
+pub(crate) use self::recovery::MicrophoneReplacementReconciliation;
+use self::recovery::{
+    replacement_continuity_reached, MicrophoneControl, PendingMicrophoneReplacement,
+};
+#[cfg(test)]
+use self::selection::{choose_recovery_fallback, select_discovered_microphone};
+use self::selection::{MicrophoneDiagnosticIdentity, MicrophoneSelection};
 use crate::error::CaptureError;
-use crate::streaming::{AudioChunk, AudioChunkLineage, ChunkAccumulator, SourceRole};
+use crate::streaming::AudioChunk;
+#[cfg(test)]
+use crate::streaming::{AudioChunkLineage, SourceRole};
 use pocketstation::{
-    AudioFrameDuration, CaptureNativeFormat, DeviceId, DeviceSelector, Session, SessionEventKind,
-    SessionSourceActivityObservations, SessionSourceActivityPolicy, SessionSourceActivityState,
-    SessionSourceReplacement, SessionSourceSignalEvaluation, SessionSourceSignalObservations,
-    SessionSourceSignalPolicy, SessionSourceSignalState, Source, SourceKind, StemId,
+    AudioFrameDuration, CaptureNativeFormat, DeviceSelector, Session, SessionEventKind,
+    SessionSourceActivityPolicy, SessionSourceReplacementError, SessionSourceSignalPolicy, Source,
+    StemId,
+};
+#[cfg(test)]
+use pocketstation::{
+    DeviceId, SessionSourceActivityObservations, SessionSourceActivityState,
+    SessionSourceReplacementObservations, SessionSourceSignalEvaluation, SessionSourceSignalState,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 const AUDIO_POLL_TIMEOUT: Duration = Duration::from_millis(50);
-const CONTROL_TIMEOUT: Duration = Duration::from_millis(1_500);
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
-const STALL_TIMEOUT: Duration = Duration::from_secs(2);
-const EXACT_ZERO_TIMEOUT: Duration = Duration::from_millis(1_500);
-const MINIMUM_PEAK_DBFS: f64 = -45.0;
-const MINIMUM_RMS_DBFS: f64 = -55.0;
-// #1057's failed Logi HFP stem was not bit-exact zero: its measured peak was
-// -78.3 dBFS and its mean level was -91 dBFS. Keep this observation threshold
-// well below ordinary quiet speech, and require it to persist before warning
-// the user. Amplitude alone never authorizes source recovery.
-const UNUSABLE_LOW_SIGNAL_MAXIMUM_PEAK_DBFS: f64 = -70.0;
-const UNUSABLE_LOW_SIGNAL_MAXIMUM_RMS_DBFS: f64 = -80.0;
-const UNUSABLE_LOW_SIGNAL_TIMEOUT: Duration = Duration::from_millis(1_500);
 const OUTPUT_QUEUE_CAPACITY_CHUNKS: usize = 64;
 const CONTROL_QUEUE_CAPACITY: usize = 4;
-const POCKETSTATION_SAMPLE_RATE_HZ: u32 = 48_000;
-const MINUTES_SAMPLE_RATE_HZ: u32 = 16_000;
-const MAX_SEQUENCE_GAP_DURATION: Duration = Duration::from_secs(2);
-const MAX_TIMESTAMP_JITTER: Duration = Duration::from_millis(2);
-const SOURCE_FRAME_DURATION_NS: u64 = 10_000_000;
-const SOURCE_FRAME_SAMPLES: usize =
-    (MINUTES_SAMPLE_RATE_HZ as usize * SOURCE_FRAME_DURATION_NS as usize) / 1_000_000_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MicrophoneSignalState {
-    AwaitingFirstFrame,
-    Active,
-    NoFrames,
-    Stalled,
-    ExactDigitalZeroPending,
-    DigitallySilent,
-    BelowThresholds,
-    SustainedLowSignal,
-    SignalObserved,
-    NonFiniteSamples,
-    SourceFailed,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct MicrophoneObservations {
-    pub(crate) state: MicrophoneSignalState,
-    pub(crate) native_format: Option<CaptureNativeFormat>,
-    pub(crate) activity: Option<SessionSourceActivityObservations>,
-    pub(crate) signal: Option<SessionSourceSignalObservations>,
-    pub(crate) source_generation: u32,
-    pub(crate) discontinuity_epoch: u64,
-}
-
-impl Default for MicrophoneObservations {
-    fn default() -> Self {
-        Self {
-            state: MicrophoneSignalState::AwaitingFirstFrame,
-            native_format: None,
-            activity: None,
-            signal: None,
-            source_generation: 1,
-            discontinuity_epoch: 0,
-        }
-    }
-}
-
-impl MicrophoneObservations {
-    pub(crate) fn requires_recovery(self) -> bool {
-        matches!(
-            self.state,
-            MicrophoneSignalState::NoFrames
-                | MicrophoneSignalState::Stalled
-                | MicrophoneSignalState::DigitallySilent
-                | MicrophoneSignalState::NonFiniteSamples
-                | MicrophoneSignalState::SourceFailed
-        )
-    }
-
-    pub(crate) fn confirms_recovery(self) -> bool {
-        self.state == MicrophoneSignalState::SignalObserved
-    }
-}
-
-#[derive(Debug, Default)]
-struct LowSignalTracker {
-    started_at_ns: Option<u64>,
-    source_generation: u32,
-    discontinuity_epoch: u64,
-}
-
-impl LowSignalTracker {
-    fn observe(
-        &mut self,
-        observed_at_ns: u64,
-        source_generation: u32,
-        discontinuity_epoch: u64,
-        peak_dbfs: Option<f64>,
-        rms_dbfs: Option<f64>,
-    ) -> bool {
-        let source_changed = self.source_generation != source_generation
-            || self.discontinuity_epoch != discontinuity_epoch;
-        let unusably_low = peak_dbfs.is_some_and(|peak| {
-            peak <= UNUSABLE_LOW_SIGNAL_MAXIMUM_PEAK_DBFS
-                && rms_dbfs.is_some_and(|rms| rms <= UNUSABLE_LOW_SIGNAL_MAXIMUM_RMS_DBFS)
-        });
-
-        if source_changed || !unusably_low {
-            self.started_at_ns = None;
-            self.source_generation = source_generation;
-            self.discontinuity_epoch = discontinuity_epoch;
-        }
-        if !unusably_low {
-            return false;
-        }
-
-        let started_at_ns = *self.started_at_ns.get_or_insert(observed_at_ns);
-        observed_at_ns.saturating_sub(started_at_ns)
-            >= UNUSABLE_LOW_SIGNAL_TIMEOUT.as_nanos() as u64
-    }
-}
-
-#[derive(Debug, Clone)]
-struct MicrophoneSelection {
-    selector: DeviceSelector,
-    device_id: String,
-    display_name: String,
-}
-
-impl MicrophoneSelection {
-    fn resolve(
-        device_override: Option<&str>,
-        resolved_default_name: &str,
-    ) -> Result<Self, CaptureError> {
-        use cpal::traits::{DeviceTrait, HostTrait};
-
-        let explicit_request = device_override
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"));
-        let (requested, exact_device_id) = if let Some(requested) = explicit_request {
-            (requested.to_owned(), None)
-        } else {
-            let default = cpal::default_host().default_input_device().ok_or_else(|| {
-                capture_error(
-                    "select PocketStation microphone",
-                    "no default input device is available",
-                )
-            })?;
-            let device_id = default.id().map_err(|error| {
-                capture_error(
-                    "select PocketStation microphone",
-                    format!("read default input device identity: {error}"),
-                )
-            })?;
-            (
-                resolved_default_name.to_owned(),
-                Some(device_id.to_string()),
-            )
-        };
-
-        select_discovered_microphone(
-            discovered_microphones(),
-            &requested,
-            exact_device_id.as_deref(),
-        )
-    }
-
-    fn recovery_fallback(
-        current_device_id: Option<&str>,
-        resolved_default_name: &str,
-    ) -> Result<Self, CaptureError> {
-        let default = Self::resolve(None, resolved_default_name).ok();
-        choose_recovery_fallback(current_device_id, default).ok_or_else(|| {
-            capture_error(
-                "select PocketStation microphone fallback",
-                "the system default input still resolves to the failed microphone; stop this recording, change or select the microphone, then start a new recording",
-            )
-        })
-    }
-}
-
-fn select_discovered_microphone(
-    sources: Vec<MicrophoneSelection>,
-    requested: &str,
-    exact_device_id: Option<&str>,
-) -> Result<MicrophoneSelection, CaptureError> {
-    let mut matching = sources.into_iter().filter(|source| {
-        exact_device_id.map_or_else(
-            || source.display_name.eq_ignore_ascii_case(requested) || source.device_id == requested,
-            |device_id| source.device_id == device_id,
-        )
-    });
-    let selected = matching.next().ok_or_else(|| {
-        capture_error(
-            "select PocketStation microphone",
-            format!("no input device matches '{requested}'"),
-        )
-    })?;
-    if matching.next().is_some() {
-        return Err(capture_error(
-            "select PocketStation microphone",
-            format!("more than one input device matches '{requested}'"),
-        ));
-    }
-    Ok(selected)
-}
-
-fn discovered_microphones() -> Vec<MicrophoneSelection> {
-    pocketstation::discover_sources()
-        .into_iter()
-        .filter(|source| source.stable_id.kind == SourceKind::InputDevice)
-        .filter_map(|source| {
-            let device_id = source.device_uid?;
-            Some(MicrophoneSelection {
-                selector: DeviceSelector::id(DeviceId::new(device_id.clone())),
-                device_id,
-                display_name: source.name,
-            })
-        })
-        .collect()
-}
-
-fn choose_recovery_fallback(
-    current_device_id: Option<&str>,
-    default: Option<MicrophoneSelection>,
-) -> Option<MicrophoneSelection> {
-    let current_device_id = current_device_id?;
-    default.filter(|default| default.device_id != current_device_id)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SignalWindowContinuity {
-    source_generation: u32,
-    discontinuity_epoch: u64,
-    samples_observed_total: u64,
-}
-
-impl From<SessionSourceSignalObservations> for SignalWindowContinuity {
-    fn from(observations: SessionSourceSignalObservations) -> Self {
-        Self {
-            source_generation: observations.window_source_generation,
-            discontinuity_epoch: observations.window_discontinuity_epoch,
-            samples_observed_total: observations.samples_observed_total,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct ObservationContinuityTracker {
-    continuity: Option<(u32, u64)>,
-    started_at_ns: u64,
-    activity_frames_baseline: u64,
-    signal_samples_baseline: u64,
-}
-
-impl ObservationContinuityTracker {
-    fn project_activity(
-        &mut self,
-        activity: Option<SessionSourceActivityObservations>,
-        signal: Option<SignalWindowContinuity>,
-        source_generation: u32,
-        discontinuity_epoch: u64,
-    ) -> (Option<SessionSourceActivityObservations>, bool) {
-        let continuity = (source_generation, discontinuity_epoch);
-        if self.continuity != Some(continuity) {
-            let first_attachment = self.continuity.is_none();
-            self.continuity = Some(continuity);
-            self.started_at_ns = activity.map_or(0, |entry| {
-                if first_attachment {
-                    entry.session_started_at_ns
-                } else {
-                    entry.observed_at_ns
-                }
-            });
-            self.activity_frames_baseline = if first_attachment {
-                0
-            } else {
-                activity.map_or(0, |entry| entry.frames_received_total)
-            };
-            self.signal_samples_baseline = if first_attachment {
-                0
-            } else {
-                signal.map_or(0, |entry| entry.samples_observed_total)
-            };
-        }
-        if self.started_at_ns == 0 {
-            self.started_at_ns = activity.map_or(0, |entry| entry.observed_at_ns);
-        }
-
-        let current_signal_observed = signal.is_some_and(|entry| {
-            entry.source_generation == source_generation
-                && entry.discontinuity_epoch == discontinuity_epoch
-                && entry.samples_observed_total > self.signal_samples_baseline
-        });
-        let projected_activity = activity.map(|entry| {
-            let frames_received_total = entry
-                .frames_received_total
-                .saturating_sub(self.activity_frames_baseline);
-            let current_frame_observed = current_signal_observed && frames_received_total > 0;
-            let latest_frame_received_at_ns = if current_frame_observed {
-                entry.latest_frame_received_at_ns
-            } else {
-                None
-            };
-            SessionSourceActivityObservations {
-                session_started_at_ns: self.started_at_ns,
-                observed_at_ns: entry.observed_at_ns,
-                first_frame_received_at_ns: latest_frame_received_at_ns,
-                latest_frame_received_at_ns,
-                frames_received_total: if current_frame_observed {
-                    frames_received_total
-                } else {
-                    0
-                },
-            }
-        });
-        (projected_activity, current_signal_observed)
-    }
-}
-
-struct MicrophoneObservationEvaluator {
-    activity_policy: SessionSourceActivityPolicy,
-    signal_policy: SessionSourceSignalPolicy,
-    low_signal: LowSignalTracker,
-    continuity: ObservationContinuityTracker,
-}
-
-impl MicrophoneObservationEvaluator {
-    fn new(
-        activity_policy: SessionSourceActivityPolicy,
-        signal_policy: SessionSourceSignalPolicy,
-    ) -> Self {
-        Self {
-            activity_policy,
-            signal_policy,
-            low_signal: LowSignalTracker::default(),
-            continuity: ObservationContinuityTracker::default(),
-        }
-    }
-
-    fn update_observations(
-        &mut self,
-        running: &pocketstation::RunningSession,
-        stem_id: StemId,
-        source_failed: bool,
-        observations: &Mutex<MicrophoneObservations>,
-    ) -> Option<MicrophoneObservations> {
-        let snapshot = running.metrics_snapshot().ok()?;
-        let source_index = (0..snapshot.source_count()).find(|&index| {
-            snapshot
-                .source(index)
-                .is_some_and(|source| source.stem_id == stem_id)
-        })?;
-        let raw_activity = snapshot.source_activity(source_index).copied();
-        let raw_signal = snapshot.source_signal(source_index).copied();
-        let replacement = snapshot.source_replacement(source_index).copied();
-        let native_format = snapshot
-            .source_native_format(source_index)
-            .and_then(|entry| entry.opened_native_format);
-        let source_generation = replacement.map_or(1, |entry| entry.source_generation);
-        let discontinuity_epoch = replacement.map_or(0, |entry| entry.discontinuity_epoch);
-        let (activity, current_signal_observed) = self.continuity.project_activity(
-            raw_activity,
-            raw_signal.map(SignalWindowContinuity::from),
-            source_generation,
-            discontinuity_epoch,
-        );
-        let signal = current_signal_observed.then_some(raw_signal).flatten();
-        let state = self.evaluate_observations(
-            activity,
-            signal,
-            source_generation,
-            discontinuity_epoch,
-            source_failed,
-        );
-        let observation_snapshot = MicrophoneObservations {
-            state,
-            native_format,
-            activity,
-            signal,
-            source_generation,
-            discontinuity_epoch,
-        };
-        if let Ok(mut current) = observations.lock() {
-            *current = observation_snapshot;
-        }
-        Some(observation_snapshot)
-    }
-
-    fn evaluate_observations(
-        &mut self,
-        activity: Option<SessionSourceActivityObservations>,
-        signal: Option<SessionSourceSignalObservations>,
-        source_generation: u32,
-        discontinuity_epoch: u64,
-        source_failed: bool,
-    ) -> MicrophoneSignalState {
-        let activity_state = activity.map(|activity| activity.evaluate(self.activity_policy).state);
-        let signal_evaluation = signal.map(|signal| signal.evaluate(self.signal_policy));
-        evaluate_state(
-            activity_state,
-            signal_evaluation,
-            signal.map_or_else(
-                || activity.map_or(0, |entry| entry.observed_at_ns),
-                |entry| entry.observed_at_ns,
-            ),
-            &mut self.low_signal,
-            source_generation,
-            discontinuity_epoch,
-            source_failed,
-        )
-    }
-}
-
-#[derive(Clone)]
-struct MicrophoneDiagnosticIdentity {
-    device_id: String,
-    display_name: String,
-}
-
-impl From<&MicrophoneSelection> for MicrophoneDiagnosticIdentity {
-    fn from(selection: &MicrophoneSelection) -> Self {
-        Self {
-            device_id: selection.device_id.clone(),
-            display_name: selection.display_name.clone(),
-        }
-    }
-}
-
-enum MicrophoneControl {
-    Reopen {
-        selector: DeviceSelector,
-        identity: MicrophoneDiagnosticIdentity,
-        response: crossbeam_channel::Sender<Result<SessionSourceReplacement, String>>,
-    },
-    Replace {
-        selector: DeviceSelector,
-        identity: MicrophoneDiagnosticIdentity,
-        response: crossbeam_channel::Sender<Result<SessionSourceReplacement, String>>,
-    },
-}
 
 pub(crate) struct PocketStationMicrophoneStream {
     stop: Arc<AtomicBool>,
@@ -461,6 +67,7 @@ pub(crate) struct PocketStationMicrophoneStream {
     worker: Option<JoinHandle<()>>,
     selector: DeviceSelector,
     device_id: String,
+    pending_replacement: Option<Box<PendingMicrophoneReplacement>>,
     pub(crate) receiver: crossbeam_channel::Receiver<AudioChunk>,
     pub(crate) device_name: String,
 }
@@ -541,6 +148,7 @@ impl PocketStationMicrophoneStream {
             worker: Some(worker),
             selector: selection.selector,
             device_id: selection.device_id,
+            pending_replacement: None,
             receiver,
             device_name: selection.display_name,
         })
@@ -580,12 +188,22 @@ impl PocketStationMicrophoneStream {
                 let mut observation_evaluator =
                     MicrophoneObservationEvaluator::new(activity_policy, signal_policy);
                 let mut diagnostic_identity = diagnostic_identity;
+                let mut pending_diagnostic_identity = None;
                 let mut logged_native_format_attachment = None;
                 let mut pending_format_continuity = None;
 
                 while !stop.load(Ordering::Relaxed) {
                     while let Ok(command) = control.try_recv() {
                         source_failed.store(false, Ordering::Relaxed);
+                        let continuity_before_request = observations
+                            .lock()
+                            .map(|entry| {
+                                (
+                                    entry.source_generation,
+                                    entry.discontinuity_epoch,
+                                )
+                            })
+                            .unwrap_or((1, 0));
                         let (result, identity, response) = match command {
                             MicrophoneControl::Reopen {
                                 selector,
@@ -593,8 +211,7 @@ impl PocketStationMicrophoneStream {
                                 response,
                             } => (
                                 running
-                                    .reopen_microphone_source(stem_id, selector)
-                                    .map_err(|error| error.to_string()),
+                                    .reopen_microphone_source(stem_id, selector),
                                 identity,
                                 response,
                             ),
@@ -604,19 +221,29 @@ impl PocketStationMicrophoneStream {
                                 response,
                             } => (
                                 running
-                                    .replace_microphone_source(stem_id, selector)
-                                    .map_err(|error| error.to_string()),
+                                    .replace_microphone_source(stem_id, selector),
                                 identity,
                                 response,
                             ),
                         };
-                        if let Ok(replacement) = &result {
-                            diagnostic_identity = identity;
-                            logged_native_format_attachment = None;
-                            pending_format_continuity = Some((
-                                replacement.source_generation,
-                                replacement.discontinuity_epoch,
-                            ));
+                        match &result {
+                            Ok(replacement) => {
+                                diagnostic_identity = identity;
+                                pending_diagnostic_identity = None;
+                                logged_native_format_attachment = None;
+                                pending_format_continuity = Some((
+                                    replacement.source_generation,
+                                    replacement.discontinuity_epoch,
+                                ));
+                            }
+                            Err(SessionSourceReplacementError::ResponseTimedOut { .. }) => {
+                                pending_diagnostic_identity = Some((
+                                    identity,
+                                    continuity_before_request.0.saturating_add(1),
+                                    continuity_before_request.1.saturating_add(1),
+                                ));
+                            }
+                            Err(_) => {}
                         }
                         writer.reset_for_discontinuity();
                         let _ = response.try_send(result);
@@ -702,6 +329,24 @@ impl PocketStationMicrophoneStream {
                         source_failed.load(Ordering::Relaxed),
                         &observations,
                     ) {
+                        if pending_diagnostic_identity.as_ref().is_some_and(
+                            |(_, source_generation, discontinuity_epoch)| {
+                                replacement_continuity_reached(
+                                    current_observations,
+                                    *source_generation,
+                                    *discontinuity_epoch,
+                                )
+                            },
+                        ) {
+                            if let Some((identity, source_generation, discontinuity_epoch)) =
+                                pending_diagnostic_identity.take()
+                            {
+                                diagnostic_identity = identity;
+                                logged_native_format_attachment = None;
+                                pending_format_continuity =
+                                    Some((source_generation, discontinuity_epoch));
+                            }
+                        }
                         if report_opened_native_format_once(
                             current_observations,
                             &diagnostic_identity,
@@ -742,49 +387,8 @@ impl PocketStationMicrophoneStream {
             })
     }
 
-    pub(crate) fn reopen_exact(&self) -> Result<SessionSourceReplacement, CaptureError> {
-        self.request_control(|response| MicrophoneControl::Reopen {
-            selector: self.selector.clone(),
-            identity: MicrophoneDiagnosticIdentity {
-                device_id: self.device_id.clone(),
-                display_name: self.device_name.clone(),
-            },
-            response,
-        })
-    }
-
-    pub(crate) fn replace_with_fallback(
-        &mut self,
-        resolved_default_name: String,
-    ) -> Result<SessionSourceReplacement, CaptureError> {
-        let selection =
-            MicrophoneSelection::recovery_fallback(Some(&self.device_id), &resolved_default_name)?;
-        let selector = selection.selector.clone();
-        let result = self.request_control(|response| MicrophoneControl::Replace {
-            selector: selector.clone(),
-            identity: MicrophoneDiagnosticIdentity::from(&selection),
-            response,
-        })?;
-        self.selector = selector;
-        self.device_id = selection.device_id;
-        self.device_name = selection.display_name;
-        Ok(result)
-    }
-
-    fn request_control(
-        &self,
-        command: impl FnOnce(
-            crossbeam_channel::Sender<Result<SessionSourceReplacement, String>>,
-        ) -> MicrophoneControl,
-    ) -> Result<SessionSourceReplacement, CaptureError> {
-        let (response, receiver) = crossbeam_channel::bounded(1);
-        self.control
-            .send_timeout(command(response), CONTROL_TIMEOUT)
-            .map_err(|error| capture_error("send PocketStation microphone control", error))?;
-        receiver
-            .recv_timeout(CONTROL_TIMEOUT)
-            .map_err(|error| capture_error("wait for PocketStation microphone control", error))?
-            .map_err(|error| capture_error("apply PocketStation microphone control", error))
+    pub(crate) fn device_id(&self) -> &str {
+        &self.device_id
     }
 }
 
@@ -833,82 +437,6 @@ fn stop_cancel_and_join(
         Err(_) => {
             drop(worker);
             false
-        }
-    }
-}
-
-fn evaluate_state(
-    activity_state: Option<SessionSourceActivityState>,
-    signal_evaluation: Option<SessionSourceSignalEvaluation>,
-    observed_at_ns: u64,
-    low_signal_tracker: &mut LowSignalTracker,
-    source_generation: u32,
-    discontinuity_epoch: u64,
-    source_failed: bool,
-) -> MicrophoneSignalState {
-    if source_failed {
-        low_signal_tracker.started_at_ns = None;
-        return MicrophoneSignalState::SourceFailed;
-    }
-    let sustained_low_signal = signal_evaluation.is_some_and(|evaluation| {
-        evaluation.state == SessionSourceSignalState::BelowCallerThresholds
-            && low_signal_tracker.observe(
-                observed_at_ns,
-                source_generation,
-                discontinuity_epoch,
-                evaluation.peak_dbfs,
-                evaluation.rms_dbfs,
-            )
-    });
-    if !matches!(
-        signal_evaluation,
-        Some(evaluation) if evaluation.state == SessionSourceSignalState::BelowCallerThresholds
-    ) {
-        low_signal_tracker.started_at_ns = None;
-    }
-    classify_evaluations(
-        activity_state,
-        signal_evaluation.map(|evaluation| evaluation.state),
-        sustained_low_signal,
-    )
-}
-
-fn classify_evaluations(
-    activity: Option<SessionSourceActivityState>,
-    signal: Option<SessionSourceSignalState>,
-    sustained_low_signal: bool,
-) -> MicrophoneSignalState {
-    match activity {
-        None | Some(SessionSourceActivityState::AwaitingFirstFrame) => {
-            return MicrophoneSignalState::AwaitingFirstFrame;
-        }
-        Some(SessionSourceActivityState::FirstFrameTimedOut) => {
-            return MicrophoneSignalState::NoFrames;
-        }
-        Some(SessionSourceActivityState::Stalled) => {
-            return MicrophoneSignalState::Stalled;
-        }
-        Some(SessionSourceActivityState::Active) => {}
-    }
-    match signal {
-        None | Some(SessionSourceSignalState::NoSamplesObserved) => MicrophoneSignalState::Active,
-        Some(SessionSourceSignalState::ExactDigitalZeroPending) => {
-            MicrophoneSignalState::ExactDigitalZeroPending
-        }
-        Some(SessionSourceSignalState::SustainedExactDigitalZero) => {
-            MicrophoneSignalState::DigitallySilent
-        }
-        Some(SessionSourceSignalState::BelowCallerThresholds) if sustained_low_signal => {
-            MicrophoneSignalState::SustainedLowSignal
-        }
-        Some(SessionSourceSignalState::BelowCallerThresholds) => {
-            MicrophoneSignalState::BelowThresholds
-        }
-        Some(SessionSourceSignalState::MeetsCallerThresholds) => {
-            MicrophoneSignalState::SignalObserved
-        }
-        Some(SessionSourceSignalState::NonFiniteSamplesObserved) => {
-            MicrophoneSignalState::NonFiniteSamples
         }
     }
 }
@@ -980,269 +508,6 @@ fn opened_native_format_log_entry(
         "discontinuity_epoch": discontinuity_epoch,
         "message": "PocketStation microphone opened a native input format",
     })
-}
-
-#[derive(Default)]
-struct MicrophoneAudioChunkWriter {
-    downsample_phase_samples: usize,
-    resampled_samples: Vec<f32>,
-    chunks: ChunkAccumulator,
-    pending_lineage: Option<AudioChunkLineage>,
-    latest_source_frame: Option<AudioChunkLineage>,
-}
-
-impl MicrophoneAudioChunkWriter {
-    fn reset_for_discontinuity(&mut self) {
-        self.downsample_phase_samples = 0;
-        self.resampled_samples.clear();
-        self.chunks.clear();
-        self.pending_lineage = None;
-        self.latest_source_frame = None;
-    }
-
-    fn write_frame(
-        &mut self,
-        frame: pocketstation::PolledAudioFrame<'_>,
-        sink: &crossbeam_channel::Sender<AudioChunk>,
-        dropped_chunks_total: &AtomicU64,
-    ) -> Result<(), CaptureError> {
-        if frame.sample_rate_hz() != POCKETSTATION_SAMPLE_RATE_HZ {
-            return Err(capture_error(
-                "read PocketStation microphone",
-                format!(
-                    "expected {POCKETSTATION_SAMPLE_RATE_HZ} Hz canonical audio, received {} Hz",
-                    frame.sample_rate_hz()
-                ),
-            ));
-        }
-        let channel_count = usize::from(frame.channels());
-        if channel_count == 0 || !frame.samples().len().is_multiple_of(channel_count) {
-            return Err(capture_error(
-                "read PocketStation microphone",
-                "received an invalid channel layout",
-            ));
-        }
-
-        let lineage = frame.lineage();
-        let frame_lineage = AudioChunkLineage {
-            session_id: lineage.session_id().get(),
-            source_id: lineage.source_id().get(),
-            stem_id: lineage.stem_id().get(),
-            clock_id: lineage.clock_id().get(),
-            first_sequence_number: lineage.sequence_number(),
-            last_sequence_number: lineage.sequence_number(),
-            missing_sequence_count: 0,
-            inserted_silence_samples: 0,
-            timestamp_start_ns: lineage.timestamp_start_ns(),
-            duration_ns: lineage.duration_ns(),
-            source_generation: lineage.source_generation(),
-            discontinuity_epoch: lineage.discontinuity_epoch(),
-            permission_epoch: lineage.permission_epoch(),
-            observed_at_ns: frame.route_received_at_ns(),
-            polled_at_ns: frame.polled_at_ns(),
-        };
-        self.resampled_samples.clear();
-        let downsample_ratio = (POCKETSTATION_SAMPLE_RATE_HZ / MINUTES_SAMPLE_RATE_HZ) as usize;
-        for samples in frame.samples().chunks_exact(channel_count) {
-            let mono = samples.iter().copied().sum::<f32>() / channel_count as f32;
-            if self.downsample_phase_samples == 0 {
-                self.resampled_samples.push(mono);
-            }
-            self.downsample_phase_samples = (self.downsample_phase_samples + 1) % downsample_ratio;
-        }
-
-        let resampled_samples = std::mem::take(&mut self.resampled_samples);
-        let result = self.push_source_frame_samples(
-            &resampled_samples,
-            frame_lineage,
-            sink,
-            dropped_chunks_total,
-        );
-        self.resampled_samples = resampled_samples;
-        result
-    }
-
-    fn push_source_frame_samples(
-        &mut self,
-        samples: &[f32],
-        frame_lineage: AudioChunkLineage,
-        sink: &crossbeam_channel::Sender<AudioChunk>,
-        dropped_chunks_total: &AtomicU64,
-    ) -> Result<(), CaptureError> {
-        if let Some(previous) = self.latest_source_frame {
-            if !same_source_interval(previous, frame_lineage) {
-                self.reset_for_discontinuity();
-            } else if !contiguous_source_interval(previous, frame_lineage) {
-                let missing_frames = missing_source_frames(previous, frame_lineage)?;
-                for offset in 0..missing_frames {
-                    let sequence_number = previous
-                        .last_sequence_number
-                        .saturating_add(offset)
-                        .saturating_add(1);
-                    let missing_lineage = AudioChunkLineage {
-                        first_sequence_number: sequence_number,
-                        last_sequence_number: sequence_number,
-                        missing_sequence_count: 1,
-                        inserted_silence_samples: SOURCE_FRAME_SAMPLES as u64,
-                        timestamp_start_ns: previous
-                            .timestamp_end_ns()
-                            .saturating_add(offset.saturating_mul(SOURCE_FRAME_DURATION_NS)),
-                        duration_ns: SOURCE_FRAME_DURATION_NS,
-                        observed_at_ns: frame_lineage.observed_at_ns,
-                        polled_at_ns: frame_lineage.polled_at_ns,
-                        ..frame_lineage
-                    };
-                    self.push_samples(
-                        &[0.0; SOURCE_FRAME_SAMPLES],
-                        missing_lineage,
-                        sink,
-                        dropped_chunks_total,
-                    )?;
-                }
-            }
-        }
-
-        self.push_samples(samples, frame_lineage, sink, dropped_chunks_total)?;
-        self.latest_source_frame = Some(frame_lineage);
-        Ok(())
-    }
-
-    fn push_samples(
-        &mut self,
-        samples: &[f32],
-        lineage: AudioChunkLineage,
-        sink: &crossbeam_channel::Sender<AudioChunk>,
-        dropped_chunks_total: &AtomicU64,
-    ) -> Result<(), CaptureError> {
-        self.pending_lineage = Some(merge_source_interval(self.pending_lineage, lineage));
-        let mut sink_disconnected = false;
-        let pending_lineage = &mut self.pending_lineage;
-        self.chunks.push(samples, |index, samples| {
-            let rms = (samples.iter().map(|sample| sample * sample).sum::<f32>()
-                / samples.len() as f32)
-                .sqrt();
-            let chunk = AudioChunk {
-                samples,
-                rms,
-                timestamp: Instant::now(),
-                index,
-                source: SourceRole::Voice,
-                lineage: pending_lineage.take(),
-            };
-            if deliver_chunk(sink, chunk, dropped_chunks_total).is_err() {
-                sink_disconnected = true;
-            }
-        });
-        if sink_disconnected {
-            return Err(capture_error(
-                "deliver PocketStation microphone",
-                "Minutes stopped receiving microphone audio",
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn deliver_chunk(
-    sink: &crossbeam_channel::Sender<AudioChunk>,
-    chunk: AudioChunk,
-    dropped_chunks_total: &AtomicU64,
-) -> Result<(), ()> {
-    match sink.try_send(chunk) {
-        Ok(()) => Ok(()),
-        Err(crossbeam_channel::TrySendError::Full(_)) => {
-            dropped_chunks_total.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-        Err(crossbeam_channel::TrySendError::Disconnected(_)) => Err(()),
-    }
-}
-
-fn same_source_interval(left: AudioChunkLineage, right: AudioChunkLineage) -> bool {
-    left.session_id == right.session_id
-        && left.source_id == right.source_id
-        && left.stem_id == right.stem_id
-        && left.clock_id == right.clock_id
-        && left.source_generation == right.source_generation
-        && left.discontinuity_epoch == right.discontinuity_epoch
-        && left.permission_epoch == right.permission_epoch
-}
-
-fn contiguous_source_interval(left: AudioChunkLineage, right: AudioChunkLineage) -> bool {
-    same_source_interval(left, right)
-        && right.first_sequence_number == left.last_sequence_number.saturating_add(1)
-        && source_timestamps_plausible(left, right)
-}
-
-fn source_timestamps_plausible(left: AudioChunkLineage, right: AudioChunkLineage) -> bool {
-    if right.timestamp_start_ns <= left.timestamp_start_ns {
-        return false;
-    }
-    let Some(missing_sequences) = right
-        .first_sequence_number
-        .checked_sub(left.last_sequence_number.saturating_add(1))
-    else {
-        return false;
-    };
-    let expected_start_ns = left
-        .timestamp_end_ns()
-        .saturating_add(missing_sequences.saturating_mul(SOURCE_FRAME_DURATION_NS));
-    right.timestamp_start_ns.abs_diff(expected_start_ns) <= MAX_TIMESTAMP_JITTER.as_nanos() as u64
-}
-
-fn missing_source_frames(
-    left: AudioChunkLineage,
-    right: AudioChunkLineage,
-) -> Result<u64, CaptureError> {
-    if !source_timestamps_plausible(left, right) {
-        return Err(capture_error(
-            "preserve PocketStation microphone timeline",
-            "source timestamps did not advance within the bounded repair window",
-        ));
-    }
-    let missing_sequences = right
-        .first_sequence_number
-        .checked_sub(left.last_sequence_number.saturating_add(1))
-        .ok_or_else(|| {
-            capture_error(
-                "preserve PocketStation microphone timeline",
-                "source sequence moved backwards or overlapped",
-            )
-        })?;
-    let missing_duration_ns = missing_sequences.saturating_mul(SOURCE_FRAME_DURATION_NS);
-    if missing_duration_ns > MAX_SEQUENCE_GAP_DURATION.as_nanos() as u64 {
-        return Err(capture_error(
-            "preserve PocketStation microphone timeline",
-            format!(
-                "source gap of {missing_duration_ns} ns exceeds the bounded {} ns repair window",
-                MAX_SEQUENCE_GAP_DURATION.as_nanos()
-            ),
-        ));
-    }
-    Ok(missing_sequences)
-}
-
-fn merge_source_interval(
-    current: Option<AudioChunkLineage>,
-    next: AudioChunkLineage,
-) -> AudioChunkLineage {
-    let Some(mut current) = current else {
-        return next;
-    };
-    debug_assert!(same_source_interval(current, next));
-    current.last_sequence_number = next.last_sequence_number;
-    current.missing_sequence_count = current
-        .missing_sequence_count
-        .saturating_add(next.missing_sequence_count);
-    current.inserted_silence_samples = current
-        .inserted_silence_samples
-        .saturating_add(next.inserted_silence_samples);
-    current.duration_ns = next
-        .timestamp_end_ns()
-        .saturating_sub(current.timestamp_start_ns);
-    current.observed_at_ns = current.observed_at_ns.min(next.observed_at_ns);
-    current.polled_at_ns = current.polled_at_ns.max(next.polled_at_ns);
-    current
 }
 
 fn capture_error(operation: &str, error: impl std::fmt::Display) -> CaptureError {
@@ -1972,5 +1237,67 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100));
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
         assert_eq!(receiver.len(), 1);
+    }
+
+    #[test]
+    fn replacement_timeout_remains_pending_until_new_continuity_is_observed() {
+        let outcome = MicrophoneReplacementOutcome::Pending {
+            source_generation: 2,
+            discontinuity_epoch: 1,
+            timeout_ms: 1_000,
+        };
+        assert!(outcome.is_pending());
+        assert_eq!(outcome.continuity(), (2, 1));
+
+        let before = MicrophoneObservations {
+            source_generation: 1,
+            discontinuity_epoch: 0,
+            ..MicrophoneObservations::default()
+        };
+        assert!(!replacement_continuity_reached(before, 2, 1));
+
+        let after = MicrophoneObservations {
+            source_generation: 2,
+            discontinuity_epoch: 1,
+            replacement: Some(SessionSourceReplacementObservations {
+                stem_id: StemId::new(1),
+                attempts_total: 1,
+                completed_total: 0,
+                failed_before_attach_total: 0,
+                response_timeouts_total: 1,
+                attached_source_id: None,
+                source_generation: 2,
+                discontinuity_epoch: 1,
+                latest_completed_at_ns: None,
+            }),
+            ..MicrophoneObservations::default()
+        };
+        assert!(!replacement_continuity_reached(after, 2, 1));
+
+        let attached = MicrophoneObservations {
+            replacement: Some(SessionSourceReplacementObservations {
+                attached_source_id: Some(pocketstation::SourceId::new(7)),
+                completed_total: 1,
+                latest_completed_at_ns: Some(5),
+                ..after.replacement.expect("replacement observations")
+            }),
+            ..after
+        };
+        assert!(replacement_continuity_reached(attached, 2, 1));
+
+        let later_attachment = MicrophoneObservations {
+            source_generation: 3,
+            discontinuity_epoch: 2,
+            replacement: Some(SessionSourceReplacementObservations {
+                source_generation: 3,
+                discontinuity_epoch: 2,
+                ..attached.replacement.expect("replacement observations")
+            }),
+            ..attached
+        };
+        assert!(
+            !replacement_continuity_reached(later_attachment, 2, 1),
+            "a later replacement must not be labelled with an older pending device identity"
+        );
     }
 }

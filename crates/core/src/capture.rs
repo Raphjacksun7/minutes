@@ -5,7 +5,9 @@ use crate::pid::CaptureMode;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+#[cfg(feature = "streaming")]
+use std::time::Duration;
+use std::time::Instant;
 
 #[cfg(feature = "streaming")]
 use crate::streaming::AudioStream;
@@ -510,6 +512,25 @@ struct VoiceLowSignalNotice {
 struct RecoveredVoiceStream {
     stream: VoiceCaptureStream,
     lineage_floor: Option<VoiceLineageFloor>,
+    replacement_pending: bool,
+}
+
+#[cfg(all(
+    feature = "streaming",
+    feature = "pocketstation-capture",
+    target_os = "macos"
+))]
+enum VoiceReplacementReconciliation {
+    Attached {
+        previous_device_name: String,
+        device_name: String,
+        lineage_floor: VoiceLineageFloor,
+    },
+    Detached {
+        source_generation: u32,
+        discontinuity_epoch: u64,
+    },
+    Failed(String),
 }
 
 #[cfg(feature = "streaming")]
@@ -555,6 +576,58 @@ impl VoiceCaptureStream {
             Self::Cpal(stream) => &stream.device_name,
             #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
             Self::PocketStation(stream) => &stream.device_name,
+        }
+    }
+
+    fn device_id(&self) -> Option<&str> {
+        match self {
+            Self::Cpal(_) => None,
+            #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
+            Self::PocketStation(stream) => Some(stream.device_id()),
+        }
+    }
+
+    fn replacement_pending(&self) -> bool {
+        match self {
+            Self::Cpal(_) => false,
+            #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
+            Self::PocketStation(stream) => stream.replacement_pending(),
+        }
+    }
+
+    #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
+    fn reconcile_pending_replacement(&mut self) -> Option<VoiceReplacementReconciliation> {
+        use crate::pocketstation_microphone::MicrophoneReplacementReconciliation as Reconciliation;
+
+        let previous_device_name = self.device_name().to_owned();
+        match self {
+            Self::Cpal(_) => None,
+            Self::PocketStation(stream) => {
+                stream
+                    .reconcile_pending_replacement()
+                    .map(|reconciliation| match reconciliation {
+                        Reconciliation::Attached(completion) => {
+                            VoiceReplacementReconciliation::Attached {
+                                previous_device_name,
+                                device_name: completion.device_name,
+                                lineage_floor: VoiceLineageFloor {
+                                    source_generation: completion.source_generation,
+                                    discontinuity_epoch: completion.discontinuity_epoch,
+                                },
+                            }
+                        }
+                        Reconciliation::Detached {
+                            source_generation,
+                            discontinuity_epoch,
+                        } => VoiceReplacementReconciliation::Detached {
+                            source_generation,
+                            discontinuity_epoch,
+                        },
+                        Reconciliation::Failed(message) => {
+                            VoiceReplacementReconciliation::Failed(message)
+                        }
+                    })
+            }
         }
     }
 
@@ -696,17 +769,19 @@ impl VoiceCaptureStream {
                     RecoveredVoiceStream {
                         stream: Self::Cpal(stream),
                         lineage_floor: None,
+                        replacement_pending: false,
                     }
                 })
             }
             #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
             Self::PocketStation(mut stream) => {
                 if action == VoiceRecoveryAction::RestartWorker || stream.has_error() {
+                    let previous_device_id = stream.device_id().to_owned();
                     drop(stream);
                     let restarted = match action {
                         VoiceRecoveryAction::ReplaceWithFallback => {
                             crate::pocketstation_microphone::PocketStationMicrophoneStream::start_fallback(
-                                plan.voice_override.as_deref(),
+                                Some(&previous_device_id),
                                 &plan.voice_device_name,
                             )
                         }
@@ -720,10 +795,11 @@ impl VoiceCaptureStream {
                     return restarted.map(|stream| RecoveredVoiceStream {
                         stream: Self::PocketStation(stream),
                         lineage_floor: None,
+                        replacement_pending: false,
                     });
                 }
 
-                let replacement = match action {
+                let outcome = match action {
                     VoiceRecoveryAction::RestartWorker => unreachable!("handled above"),
                     VoiceRecoveryAction::ReopenExact => stream.reopen_exact(),
                     VoiceRecoveryAction::ReplaceWithFallback => {
@@ -732,19 +808,24 @@ impl VoiceCaptureStream {
                         stream.replace_with_fallback(default_name)
                     }
                 }?;
+                let (source_generation, discontinuity_epoch) = outcome.continuity();
+                let replacement_pending = outcome.is_pending();
                 tracing::info!(
-                    source_id = replacement.source_id.get(),
-                    source_generation = replacement.source_generation,
-                    discontinuity_epoch = replacement.discontinuity_epoch,
+                    source_generation,
+                    discontinuity_epoch,
+                    replacement_pending,
                     action = ?action,
-                    "PocketStation microphone recovery attached a new source generation"
+                    "PocketStation microphone recovery requested a new source generation"
                 );
                 Ok(RecoveredVoiceStream {
                     stream: Self::PocketStation(stream),
-                    lineage_floor: Some(VoiceLineageFloor {
-                        source_generation: replacement.source_generation,
-                        discontinuity_epoch: replacement.discontinuity_epoch,
-                    }),
+                    lineage_floor: recovery_lineage_floor(
+                        action,
+                        replacement_pending,
+                        source_generation,
+                        discontinuity_epoch,
+                    ),
+                    replacement_pending,
                 })
             }
         }
@@ -775,6 +856,21 @@ fn recovery_action(
 }
 
 #[cfg(feature = "streaming")]
+fn recovery_lineage_floor(
+    action: VoiceRecoveryAction,
+    replacement_pending: bool,
+    source_generation: u32,
+    discontinuity_epoch: u64,
+) -> Option<VoiceLineageFloor> {
+    (!replacement_pending || action == VoiceRecoveryAction::ReopenExact).then_some(
+        VoiceLineageFloor {
+            source_generation,
+            discontinuity_epoch,
+        },
+    )
+}
+
+#[cfg(feature = "streaming")]
 fn automatic_microphone_fallback_allowed(normalized_selection: Option<&str>) -> bool {
     normalized_selection.is_none_or(|selection| {
         let selection = selection.trim();
@@ -790,6 +886,14 @@ fn default_microphone_changed(
     previous_device_id
         .zip(current_device_id)
         .is_some_and(|(previous, current)| previous != current)
+}
+
+#[cfg(feature = "streaming")]
+fn active_microphone_device_id<'a>(
+    current_device_id: Option<&'a str>,
+    initial_device_id: Option<&'a str>,
+) -> Option<&'a str> {
+    current_device_id.or(initial_device_id)
 }
 
 #[cfg(feature = "streaming")]
@@ -1466,16 +1570,20 @@ impl DualCaptureWriters {
                 "could not derive per-source stem paths for dual-source capture",
             ))
         })?;
+        let voice_lineage_path = voice_lineage_path_for(output_path).ok_or_else(|| {
+            CaptureError::Io(std::io::Error::other(
+                "could not derive microphone lineage path for dual-source capture",
+            ))
+        })?;
+        // A reused output name must never inherit source identity from an
+        // earlier recording that reached the lineage writer first.
+        std::fs::File::create(&voice_lineage_path)?;
 
         Ok(Self {
             mixed: create_wav_writer(output_path)?,
             voice: create_wav_writer(&stems.voice)?,
             system: create_wav_writer(&stems.system)?,
-            voice_lineage_path: voice_lineage_path_for(output_path).ok_or_else(|| {
-                CaptureError::Io(std::io::Error::other(
-                    "could not derive microphone lineage path for dual-source capture",
-                ))
-            })?,
+            voice_lineage_path,
             voice_lineage: None,
             mixed_sample_count: 0,
             voice_content: StemContent::default(),
@@ -1782,6 +1890,19 @@ fn queue_system_chunk(
 }
 
 #[cfg(feature = "streaming")]
+fn drain_system_backlog(
+    receiver: &crossbeam_channel::Receiver<crate::streaming::AudioChunk>,
+    base_slot: u64,
+    next_slot: &mut Option<u64>,
+    max_system_slot: &mut Option<u64>,
+    pending_system: &mut std::collections::BTreeMap<u64, Vec<f32>>,
+) {
+    while let Ok(chunk) = receiver.try_recv() {
+        queue_system_chunk(chunk, base_slot, next_slot, max_system_slot, pending_system);
+    }
+}
+
+#[cfg(feature = "streaming")]
 fn voice_chunk_meets_lineage_floor(
     chunk: &crate::streaming::AudioChunk,
     floor: Option<VoiceLineageFloor>,
@@ -2076,6 +2197,49 @@ fn record_to_wav_dual_source(
         }
 
         let reported_device_issue = device_monitor.check_changes();
+        #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
+        match voice_stream
+            .as_mut()
+            .and_then(VoiceCaptureStream::reconcile_pending_replacement)
+        {
+            Some(VoiceReplacementReconciliation::Attached {
+                previous_device_name,
+                device_name,
+                lineage_floor,
+            }) => {
+                minimum_voice_lineage = Some(lineage_floor);
+                reported_low_signal_continuity = None;
+                device_monitor.update_voice(&device_name);
+                eprintln!(
+                    "[minutes] PocketStation microphone replacement confirmed: {}",
+                    device_name
+                );
+                if previous_device_name != device_name {
+                    send_silence_notification_msg(&format!(
+                        "Microphone recovery changed the physical input from '{previous_device_name}' to '{device_name}'. System audio continued, and the microphone stem now has a new source generation."
+                    ));
+                }
+            }
+            Some(VoiceReplacementReconciliation::Detached {
+                source_generation,
+                discontinuity_epoch,
+            }) => {
+                reported_low_signal_continuity = None;
+                tracing::warn!(
+                    source_generation,
+                    discontinuity_epoch,
+                    "PocketStation microphone reopen detached but did not reattach; bounded recovery will continue without disturbing system audio"
+                );
+            }
+            Some(VoiceReplacementReconciliation::Failed(message)) => {
+                reported_low_signal_continuity = None;
+                tracing::warn!(
+                    error = %message,
+                    "PocketStation microphone replacement could not be reconciled; bounded recovery will continue without disturbing system audio"
+                );
+            }
+            None => {}
+        }
         if let Some(notice) = voice_stream
             .as_ref()
             .and_then(VoiceCaptureStream::low_signal_notice)
@@ -2086,7 +2250,7 @@ fn record_to_wav_dual_source(
         }
         if voice_stream
             .as_ref()
-            .is_some_and(VoiceCaptureStream::recovery_confirmed)
+            .is_some_and(|stream| !stream.replacement_pending() && stream.recovery_confirmed())
         {
             voice_recovery_stage = VoiceRecoveryStage::ExactRetryAvailable;
         }
@@ -2099,8 +2263,15 @@ fn record_to_wav_dual_source(
             Some(crate::device_monitor::DeviceIssue::Voice)
                 | Some(crate::device_monitor::DeviceIssue::Both)
         );
-        let voice_issue = voice_route_issue
-            || (voice_health_issue && Instant::now() >= voice_recovery_not_before);
+        let replacement_pending = voice_stream
+            .as_ref()
+            .is_some_and(VoiceCaptureStream::replacement_pending);
+        let worker_failed = voice_stream
+            .as_ref()
+            .is_some_and(VoiceCaptureStream::worker_failed);
+        let voice_issue = (voice_route_issue
+            || (voice_health_issue && Instant::now() >= voice_recovery_not_before))
+            && (!replacement_pending || worker_failed);
         let system_issue = system_stream
             .as_ref()
             .is_some_and(|stream| stream.has_error())
@@ -2122,9 +2293,6 @@ fn record_to_wav_dual_source(
             if let Some(stream) = voice_stream.as_ref() {
                 stream.report_recovery_context();
             }
-            let worker_failed = voice_stream
-                .as_ref()
-                .is_some_and(VoiceCaptureStream::worker_failed);
             // An explicit microphone selection is an authorization boundary:
             // retry that physical source once, but never substitute another
             // microphone without a separate user opt-in. A default-following
@@ -2132,8 +2300,14 @@ fn record_to_wav_dual_source(
             // different physical device.
             let selection_allows_automatic_fallback =
                 automatic_microphone_fallback_allowed(plan.voice_override.as_deref());
-            let default_changed = default_microphone_changed(
+            let active_voice_device_id = active_microphone_device_id(
+                voice_stream
+                    .as_ref()
+                    .and_then(VoiceCaptureStream::device_id),
                 plan.voice_device_id.as_deref(),
+            );
+            let default_changed = default_microphone_changed(
+                active_voice_device_id,
                 current_default_microphone_device_id().as_deref(),
             );
             let automatic_fallback_allowed = selection_allows_automatic_fallback && default_changed;
@@ -2164,28 +2338,43 @@ fn record_to_wav_dual_source(
                     .map(|stream| RecoveredVoiceStream {
                         stream,
                         lineage_floor: None,
+                        replacement_pending: false,
                     }),
                 ),
             };
             match recovery {
                 Some(Ok(recovered)) => {
-                    minimum_voice_lineage = recovered.lineage_floor;
+                    // A pending fallback keeps the current microphone alive,
+                    // so retain its existing floor until attachment is
+                    // confirmed. Reopen detaches first and carries a predicted
+                    // floor immediately; completed/restarted recovery replaces
+                    // the prior floor normally.
+                    if !recovered.replacement_pending || recovered.lineage_floor.is_some() {
+                        minimum_voice_lineage = recovered.lineage_floor;
+                    }
+                    reported_low_signal_continuity = None;
                     voice_stream = Some(recovered.stream);
                     let voice_name = voice_stream
                         .as_ref()
                         .map(VoiceCaptureStream::device_name)
                         .unwrap_or("Unavailable microphone")
                         .to_owned();
-                    eprintln!("[minutes] Voice capture reconnected: {}", voice_name);
-                    if let Some(previous) = previous_voice_name
-                        .as_deref()
-                        .filter(|previous| *previous != voice_name)
-                    {
-                        send_silence_notification_msg(&format!(
-                            "Microphone recovery changed the physical input from '{previous}' to '{voice_name}'. System audio continued, and the microphone stem now has a new source generation."
-                        ));
+                    if recovered.replacement_pending {
+                        eprintln!(
+                            "[minutes] Microphone replacement is still pending runtime confirmation; system audio continues"
+                        );
+                    } else {
+                        eprintln!("[minutes] Voice capture reconnected: {}", voice_name);
+                        if let Some(previous) = previous_voice_name
+                            .as_deref()
+                            .filter(|previous| *previous != voice_name)
+                        {
+                            send_silence_notification_msg(&format!(
+                                "Microphone recovery changed the physical input from '{previous}' to '{voice_name}'. System audio continued, and the microphone stem now has a new source generation."
+                            ));
+                        }
+                        device_monitor.update_voice(&voice_name);
                     }
-                    device_monitor.update_voice(&voice_name);
                     voice_recovery_stage = match action {
                         Some(
                             VoiceRecoveryAction::RestartWorker | VoiceRecoveryAction::ReopenExact,
@@ -2268,15 +2457,13 @@ fn record_to_wav_dual_source(
             // during recovery before assigning index zero of the recovered
             // microphone. Those slots are therefore finalized with voice
             // silence instead of being paired with later speech.
-            while let Ok(chunk) = system_backend_rx.try_recv() {
-                queue_system_chunk(
-                    chunk,
-                    system_slot_base,
-                    &mut next_slot,
-                    &mut max_system_slot,
-                    &mut pending_system,
-                );
-            }
+            drain_system_backlog(
+                &system_backend_rx,
+                system_slot_base,
+                &mut next_slot,
+                &mut max_system_slot,
+                &mut pending_system,
+            );
             voice_slot_base =
                 next_source_slot_base(voice_slot_base, max_voice_slot, max_system_slot);
         }
@@ -2284,7 +2471,13 @@ fn record_to_wav_dual_source(
         if system_issue {
             tracing::warn!("system stream issue detected — attempting system-only restart");
             system_stream.take();
-            while system_backend_rx.try_recv().is_ok() {}
+            drain_system_backlog(
+                &system_backend_rx,
+                system_slot_base,
+                &mut next_slot,
+                &mut max_system_slot,
+                &mut pending_system,
+            );
             match system_backend.start(system_tx.clone()) {
                 Ok(new_system) => {
                     let new_system_name = new_system
@@ -4804,6 +4997,33 @@ mod tests {
         );
         assert!(continue_without_voice(true, false));
         assert!(!continue_without_voice(false, false));
+
+        assert_eq!(
+            active_microphone_device_id(Some("fallback-uid"), Some("initial-uid")),
+            Some("fallback-uid"),
+            "later recovery decisions must compare the OS default with the currently attached microphone"
+        );
+        assert_eq!(
+            recovery_lineage_floor(VoiceRecoveryAction::ReopenExact, true, 2, 1),
+            Some(VoiceLineageFloor {
+                source_generation: 2,
+                discontinuity_epoch: 1,
+            }),
+            "a timed-out exact reopen has already detached the old source, so stale frames must be rejected immediately"
+        );
+        assert_eq!(
+            recovery_lineage_floor(VoiceRecoveryAction::ReplaceWithFallback, true, 2, 1),
+            None,
+            "a pending fallback keeps the current source attached until runtime confirmation"
+        );
+        assert_eq!(
+            recovery_lineage_floor(VoiceRecoveryAction::ReplaceWithFallback, false, 2, 1),
+            Some(VoiceLineageFloor {
+                source_generation: 2,
+                discontinuity_epoch: 1,
+            }),
+            "a confirmed fallback starts the new source generation"
+        );
     }
 
     #[cfg(feature = "streaming")]
@@ -4952,6 +5172,57 @@ mod tests {
             dual_source_safe_slot(false, false, Some(12), Some(15)),
             None
         );
+    }
+
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn system_restart_preserves_every_chunk_already_accepted_by_the_backend() {
+        use crate::streaming::{AudioChunk, SourceRole};
+
+        let (sender, receiver) = crossbeam_channel::bounded(4);
+        for index in 0..3 {
+            sender
+                .send(AudioChunk {
+                    samples: vec![index as f32 + 0.25; DUAL_SOURCE_SLOT_SAMPLES],
+                    rms: 0.25,
+                    timestamp: Instant::now(),
+                    index,
+                    source: SourceRole::Call,
+                    lineage: None,
+                })
+                .unwrap();
+        }
+
+        let mut next_slot = None;
+        let mut max_system_slot = None;
+        let mut pending_system = std::collections::BTreeMap::new();
+        drain_system_backlog(
+            &receiver,
+            7,
+            &mut next_slot,
+            &mut max_system_slot,
+            &mut pending_system,
+        );
+
+        assert_eq!(next_slot, Some(7));
+        assert_eq!(max_system_slot, Some(9));
+        assert_eq!(pending_system.len(), 3);
+        assert_eq!(pending_system[&7][0], 0.25);
+        assert_eq!(pending_system[&9][0], 2.25);
+    }
+
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn reused_output_path_cannot_inherit_an_old_microphone_lineage_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("meeting.wav");
+        let lineage = temp.path().join("meeting.voice.lineage.jsonl");
+        std::fs::write(&lineage, "stale source identity\n").unwrap();
+
+        let writers = DualCaptureWriters::new(&output).unwrap();
+        let _ = writers.finalize().unwrap();
+
+        assert_eq!(std::fs::read_to_string(lineage).unwrap(), "");
     }
 
     #[cfg(feature = "streaming")]
