@@ -13,19 +13,18 @@ use std::time::Instant;
 mod voice_recovery;
 #[cfg(feature = "streaming")]
 mod voice_source;
+#[cfg(feature = "streaming")]
+mod voice_types;
 
-#[cfg(all(test, feature = "streaming"))]
-use voice_recovery::recovery_lineage_floor;
-#[cfg(all(test, feature = "streaming"))]
-use voice_recovery::VoiceLowSignalNotice;
 #[cfg(feature = "streaming")]
 use voice_recovery::{
     active_microphone_device_id, automatic_microphone_fallback_allowed, continue_without_voice,
     current_default_microphone_device_id, default_microphone_changed, microphone_degraded_message,
     recovery_action, report_recovery_context, report_sustained_low_signal,
-    should_report_low_signal, MicrophoneDegradedReason, VoiceLineageFloor, VoiceRecoveryAction,
-    VoiceRecoveryStage,
+    should_report_low_signal,
 };
+#[cfg(all(test, feature = "streaming"))]
+use voice_source::recovery_lineage_floor;
 #[cfg(all(
     feature = "streaming",
     feature = "pocketstation-capture",
@@ -34,6 +33,12 @@ use voice_recovery::{
 use voice_source::VoiceReplacementReconciliation;
 #[cfg(feature = "streaming")]
 use voice_source::{RecoveredVoiceStream, VoiceCaptureStream};
+#[cfg(all(test, feature = "streaming"))]
+use voice_types::VoiceLowSignalNotice;
+#[cfg(feature = "streaming")]
+use voice_types::{
+    MicrophoneDegradedReason, VoiceLineageFloor, VoiceRecoveryAction, VoiceRecoveryStage,
+};
 
 /// Shared audio level (0–100 scale) for UI visualization.
 /// Updated ~10x per second from the cpal callback.
@@ -1804,8 +1809,11 @@ fn record_to_wav_dual_source(
                 .as_ref()
                 .map(VoiceCaptureStream::device_name)
                 .map(str::to_owned);
-            if let Some(stream) = voice_stream.as_ref() {
-                report_recovery_context(stream);
+            if let Some(context) = voice_stream
+                .as_ref()
+                .and_then(VoiceCaptureStream::recovery_context)
+            {
+                report_recovery_context(context);
             }
             // An explicit microphone selection is an authorization boundary:
             // retry that physical source once, but never substitute another

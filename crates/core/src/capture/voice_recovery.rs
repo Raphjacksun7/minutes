@@ -1,41 +1,8 @@
-use super::voice_source::VoiceCaptureStream;
+use super::voice_types::{
+    MicrophoneDegradedReason, VoiceLowSignalNotice, VoiceRecoveryAction, VoiceRecoveryContext,
+    VoiceRecoveryStage, VoiceSourceHealth,
+};
 use super::{cached_default_host, send_silence_notification_msg};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum VoiceRecoveryAction {
-    RestartWorker,
-    ReopenExact,
-    ReplaceWithFallback,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum VoiceRecoveryStage {
-    ExactRetryAvailable,
-    FallbackRequired,
-    FallbackExhausted,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum MicrophoneDegradedReason {
-    ExplicitSelection,
-    DefaultUnchanged,
-    ChangedDefaultAttachFailed,
-    FallbackExhausted,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct VoiceLineageFloor {
-    pub(super) source_generation: u32,
-    pub(super) discontinuity_epoch: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct VoiceLowSignalNotice {
-    pub(super) source_generation: u32,
-    pub(super) discontinuity_epoch: u64,
-    pub(super) peak_dbfs: Option<f64>,
-    pub(super) rms_dbfs: Option<f64>,
-}
 
 pub(super) fn recovery_action(
     stage: VoiceRecoveryStage,
@@ -56,21 +23,6 @@ pub(super) fn recovery_action(
         }
         VoiceRecoveryStage::FallbackRequired | VoiceRecoveryStage::FallbackExhausted => None,
     }
-}
-
-#[cfg(any(test, all(feature = "pocketstation-capture", target_os = "macos")))]
-pub(super) fn recovery_lineage_floor(
-    action: VoiceRecoveryAction,
-    replacement_pending: bool,
-    source_generation: u32,
-    discontinuity_epoch: u64,
-) -> Option<VoiceLineageFloor> {
-    (!replacement_pending || action == VoiceRecoveryAction::ReopenExact).then_some(
-        VoiceLineageFloor {
-            source_generation,
-            discontinuity_epoch,
-        },
-    )
 }
 
 pub(super) fn automatic_microphone_fallback_allowed(normalized_selection: Option<&str>) -> bool {
@@ -106,53 +58,40 @@ pub(super) fn current_default_microphone_device_id() -> Option<String> {
         .map(|id| id.to_string())
 }
 
-pub(super) fn report_recovery_context(stream: &VoiceCaptureStream) {
-    #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
-    if let Some(observations) = stream.observations() {
-        use crate::pocketstation_microphone::MicrophoneSignalState;
-
-        eprintln!(
-            "[minutes] PocketStation microphone recovery reason: {:?}",
-            observations.state
-        );
-        tracing::warn!(
-            state = ?observations.state,
-            native_format = ?observations.native_format,
-            frames_received_total = observations
-                .activity
-                .map_or(0, |activity| activity.frames_received_total),
-            peak_dbfs = observations
-                .signal
-                .and_then(|signal| signal.window_peak_dbfs()),
-            rms_dbfs = observations
-                .signal
-                .and_then(|signal| signal.window_rms_dbfs()),
-            "PocketStation microphone needs host recovery"
-        );
-        let message = match observations.state {
-            MicrophoneSignalState::NoFrames => Some(
+pub(super) fn report_recovery_context(context: VoiceRecoveryContext) {
+    eprintln!(
+        "[minutes] PocketStation microphone recovery reason: {:?}",
+        context.health
+    );
+    tracing::warn!(
+        state = ?context.health,
+        native_format = ?context.native_format,
+        frames_received_total = context.frames_received_total,
+        peak_dbfs = context.peak_dbfs,
+        rms_dbfs = context.rms_dbfs,
+        "PocketStation microphone needs host recovery"
+    );
+    let message = match context.health {
+            VoiceSourceHealth::NoFrames => Some(
                 "The selected microphone opened but delivered no audio frames. Minutes is retrying it while system audio continues.",
             ),
-            MicrophoneSignalState::Stalled => Some(
+            VoiceSourceHealth::Stalled => Some(
                 "The selected microphone stopped delivering audio. Minutes is retrying it while system audio continues.",
             ),
-            MicrophoneSignalState::DigitallySilent => Some(
+            VoiceSourceHealth::DigitallySilent => Some(
                 "The selected microphone is delivering digital silence. Minutes is retrying it while system audio continues.",
             ),
-            MicrophoneSignalState::NonFiniteSamples => Some(
+            VoiceSourceHealth::NonFiniteSamples => Some(
                 "The selected microphone delivered invalid samples. Minutes is retrying it while system audio continues.",
             ),
-            MicrophoneSignalState::SourceFailed => Some(
+            VoiceSourceHealth::SourceFailed => Some(
                 "The selected microphone failed. Minutes is retrying it while system audio continues.",
             ),
             _ => None,
-        };
-        if let Some(message) = message {
-            send_silence_notification_msg(message);
-        }
+    };
+    if let Some(message) = message {
+        send_silence_notification_msg(message);
     }
-    #[cfg(not(all(feature = "pocketstation-capture", target_os = "macos")))]
-    let _ = stream;
 }
 
 pub(super) fn report_sustained_low_signal(notice: VoiceLowSignalNotice) {

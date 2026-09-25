@@ -1,6 +1,7 @@
-#[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
-use super::voice_recovery::recovery_lineage_floor;
-use super::voice_recovery::{VoiceLineageFloor, VoiceLowSignalNotice, VoiceRecoveryAction};
+use super::voice_types::{
+    VoiceLineageFloor, VoiceLowSignalNotice, VoiceRecoveryAction, VoiceRecoveryContext,
+    VoiceSourceHealth,
+};
 use super::DualCapturePlan;
 #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
 use super::{cached_default_host, select_device_with_override};
@@ -185,14 +186,72 @@ impl VoiceCaptureStream {
         }
     }
 
-    #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
-    pub(super) fn observations(
-        &self,
-    ) -> Option<crate::pocketstation_microphone::MicrophoneObservations> {
+    pub(super) fn recovery_context(&self) -> Option<VoiceRecoveryContext> {
+        #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
         match self {
             Self::Cpal(_) => None,
-            Self::PocketStation(stream) => Some(stream.observations()),
+            Self::PocketStation(stream) => {
+                use crate::pocketstation_microphone::MicrophoneSignalState;
+
+                let observations = stream.observations();
+                let health = match observations.state {
+                    MicrophoneSignalState::AwaitingFirstFrame => {
+                        VoiceSourceHealth::AwaitingFirstFrame
+                    }
+                    MicrophoneSignalState::Active => VoiceSourceHealth::Active,
+                    MicrophoneSignalState::NoFrames => VoiceSourceHealth::NoFrames,
+                    MicrophoneSignalState::Stalled => VoiceSourceHealth::Stalled,
+                    MicrophoneSignalState::ExactDigitalZeroPending => {
+                        VoiceSourceHealth::ExactDigitalZeroPending
+                    }
+                    MicrophoneSignalState::DigitallySilent => VoiceSourceHealth::DigitallySilent,
+                    MicrophoneSignalState::BelowThresholds => VoiceSourceHealth::BelowThresholds,
+                    MicrophoneSignalState::SustainedLowSignal => {
+                        VoiceSourceHealth::SustainedLowSignal
+                    }
+                    MicrophoneSignalState::SignalObserved => VoiceSourceHealth::SignalObserved,
+                    MicrophoneSignalState::NonFiniteSamples => VoiceSourceHealth::NonFiniteSamples,
+                    MicrophoneSignalState::SourceFailed => VoiceSourceHealth::SourceFailed,
+                };
+                Some(VoiceRecoveryContext {
+                    health,
+                    native_format: observations.native_format.map(|format| {
+                        use pocketstation::CaptureSampleRepresentation as Representation;
+
+                        let sample_representation = match format.sample_representation {
+                            Representation::SignedInteger8 => "signed_integer_8",
+                            Representation::SignedInteger16 => "signed_integer_16",
+                            Representation::SignedInteger24 => "signed_integer_24",
+                            Representation::SignedInteger32 => "signed_integer_32",
+                            Representation::SignedInteger64 => "signed_integer_64",
+                            Representation::UnsignedInteger8 => "unsigned_integer_8",
+                            Representation::UnsignedInteger16 => "unsigned_integer_16",
+                            Representation::UnsignedInteger24 => "unsigned_integer_24",
+                            Representation::UnsignedInteger32 => "unsigned_integer_32",
+                            Representation::UnsignedInteger64 => "unsigned_integer_64",
+                            Representation::Float32 => "float_32",
+                            Representation::Float64 => "float_64",
+                        };
+                        super::voice_types::VoiceNativeFormat {
+                            sample_rate_hz: format.sample_rate_hz,
+                            channel_count: format.channel_count,
+                            sample_representation,
+                        }
+                    }),
+                    frames_received_total: observations
+                        .activity
+                        .map_or(0, |activity| activity.frames_received_total),
+                    peak_dbfs: observations
+                        .signal
+                        .and_then(|signal| signal.window_peak_dbfs()),
+                    rms_dbfs: observations
+                        .signal
+                        .and_then(|signal| signal.window_rms_dbfs()),
+                })
+            }
         }
+        #[cfg(not(all(feature = "pocketstation-capture", target_os = "macos")))]
+        None
     }
 
     pub(super) fn independent_failure(&self) -> bool {
@@ -295,4 +354,19 @@ impl VoiceCaptureStream {
             }
         }
     }
+}
+
+#[cfg(any(test, all(feature = "pocketstation-capture", target_os = "macos")))]
+pub(super) fn recovery_lineage_floor(
+    action: VoiceRecoveryAction,
+    replacement_pending: bool,
+    source_generation: u32,
+    discontinuity_epoch: u64,
+) -> Option<VoiceLineageFloor> {
+    (!replacement_pending || action == VoiceRecoveryAction::ReopenExact).then_some(
+        VoiceLineageFloor {
+            source_generation,
+            discontinuity_epoch,
+        },
+    )
 }
