@@ -98,8 +98,8 @@ callback. Minutes distinguishes these conditions:
 - frames stopped arriving;
 - frames are arriving but remain exact digital zero;
 - the measured signal is below the configured peak/RMS thresholds;
-- nonzero input remains below the separate near-silence failure envelope for
-  the bounded recovery window;
+- nonzero input remains below the separate near-silence observation envelope
+  for the bounded warning window;
 - useful signal was observed;
 - samples were non-finite; or
 - the source failed.
@@ -108,9 +108,11 @@ For a recoverable microphone failure, Minutes requests one bounded reopen of
 the exact selected device. When the recording follows the system default and
 that reopen fails, or the reopened device remains unhealthy, Minutes resolves
 one explicit fallback device ID and asks PocketStation to replace the source.
-It uses the current default when that is a different physical device;
-otherwise it prefers an available built-in/internal input before another
-alternative. If the user explicitly selected a microphone, Minutes never
+It follows the current OS default only when that default resolves to a
+different physical device. If the default still resolves to the failed
+microphone, Minutes continues system-only and asks the user to choose another
+input instead of inventing an arbitrary built-in fallback. If the user
+explicitly selected a microphone, Minutes never
 substitutes another physical device automatically: after the exact retry it
 continues system-only and tells the user to choose another microphone. This
 prevents a hardware-muted or intentionally selected headset from being
@@ -123,11 +125,18 @@ instead of pretending that two physical devices are one uninterrupted source.
 While the microphone is unavailable, the system stem continues and missing
 voice slots are represented as silence.
 
-The near-silence failure envelope is deliberately much lower than the ordinary
-signal threshold. It requires both peak at or below -70 dBFS and RMS at or
-below -80 dBFS for 1.5 seconds. This covers #1057's measured -78.3 dBFS peak
-and -91 dBFS mean level without treating ordinary quiet speech as a failed
-device.
+The near-silence observation envelope is deliberately much lower than the
+ordinary signal threshold. It requires both peak at or below -70 dBFS and RMS
+at or below -80 dBFS for 1.5 seconds. This covers #1057's measured -78.3 dBFS
+peak and -91 dBFS mean level. Crossing that envelope produces a one-shot
+persistent diagnostic and user warning; amplitude alone never authorizes
+Minutes to reopen or replace a microphone.
+
+After reopen or replacement, Minutes resets its activity/signal baseline and
+accepts a signal window only when its source generation and discontinuity
+match the current attachment. A useful window left over from the previous
+microphone therefore cannot confirm recovery before the replacement delivers
+a new frame.
 
 This is host policy, not automatic Core policy: PocketStation supplies the
 measurements, explicit reopen/replacement operations, lineage, and bounded

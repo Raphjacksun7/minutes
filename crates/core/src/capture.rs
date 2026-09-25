@@ -436,6 +436,7 @@ struct SingleCapturePlan {
 #[derive(Debug, Clone)]
 struct DualCapturePlan {
     voice_override: Option<String>,
+    voice_device_id: Option<String>,
     voice_device_name: String,
     call_override: String,
     call_device_name: String,
@@ -488,6 +489,15 @@ struct VoiceLineageFloor {
 }
 
 #[cfg(feature = "streaming")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VoiceLowSignalNotice {
+    source_generation: u32,
+    discontinuity_epoch: u64,
+    peak_dbfs: Option<f64>,
+    rms_dbfs: Option<f64>,
+}
+
+#[cfg(feature = "streaming")]
 struct RecoveredVoiceStream {
     stream: VoiceCaptureStream,
     lineage_floor: Option<VoiceLineageFloor>,
@@ -514,7 +524,7 @@ impl VoiceCaptureStream {
         #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
         if plan.uses_pocketstation_microphone() {
             return crate::pocketstation_microphone::PocketStationMicrophoneStream::start_fallback(
-                plan.voice_override.as_deref(),
+                plan.voice_device_id.as_deref(),
                 &plan.voice_device_name,
             )
             .map(Self::PocketStation);
@@ -544,18 +554,8 @@ impl VoiceCaptureStream {
             Self::Cpal(stream) => stream.has_error(),
             #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
             Self::PocketStation(stream) => {
-                use crate::pocketstation_microphone::MicrophoneSignalState;
                 let observations = stream.observations();
-                stream.has_error()
-                    || matches!(
-                        observations.state,
-                        MicrophoneSignalState::NoFrames
-                            | MicrophoneSignalState::Stalled
-                            | MicrophoneSignalState::DigitallySilent
-                            | MicrophoneSignalState::SustainedLowSignal
-                            | MicrophoneSignalState::NonFiniteSamples
-                            | MicrophoneSignalState::SourceFailed
-                    )
+                stream.has_error() || observations.requires_recovery()
             }
         }
     }
@@ -572,10 +572,30 @@ impl VoiceCaptureStream {
         match self {
             Self::Cpal(stream) => !stream.has_error(),
             #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
-            Self::PocketStation(stream) => matches!(
-                stream.observations().state,
-                crate::pocketstation_microphone::MicrophoneSignalState::SignalObserved
-            ),
+            Self::PocketStation(stream) => stream.observations().confirms_recovery(),
+        }
+    }
+
+    fn low_signal_notice(&self) -> Option<VoiceLowSignalNotice> {
+        match self {
+            Self::Cpal(_) => None,
+            #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
+            Self::PocketStation(stream) => {
+                use crate::pocketstation_microphone::MicrophoneSignalState;
+                let observations = stream.observations();
+                (observations.state == MicrophoneSignalState::SustainedLowSignal).then(|| {
+                    VoiceLowSignalNotice {
+                        source_generation: observations.source_generation,
+                        discontinuity_epoch: observations.discontinuity_epoch,
+                        peak_dbfs: observations
+                            .signal
+                            .and_then(|signal| signal.window_peak_dbfs()),
+                        rms_dbfs: observations
+                            .signal
+                            .and_then(|signal| signal.window_rms_dbfs()),
+                    }
+                })
+            }
         }
     }
 
@@ -635,9 +655,6 @@ impl VoiceCaptureStream {
                 ),
                 MicrophoneSignalState::DigitallySilent => Some(
                     "The selected microphone is delivering digital silence. Minutes is retrying it while system audio continues.",
-                ),
-                MicrophoneSignalState::SustainedLowSignal => Some(
-                    "The selected microphone is delivering only sustained near-silence. Minutes is retrying it while system audio continues.",
                 ),
                 MicrophoneSignalState::NonFiniteSamples => Some(
                     "The selected microphone delivered invalid samples. Minutes is retrying it while system audio continues.",
@@ -751,6 +768,66 @@ fn automatic_microphone_fallback_allowed(normalized_selection: Option<&str>) -> 
         let selection = selection.trim();
         selection.is_empty() || selection.eq_ignore_ascii_case("default")
     })
+}
+
+#[cfg(feature = "streaming")]
+fn default_microphone_changed(
+    previous_device_id: Option<&str>,
+    current_device_id: Option<&str>,
+) -> bool {
+    previous_device_id
+        .zip(current_device_id)
+        .is_some_and(|(previous, current)| previous != current)
+}
+
+#[cfg(feature = "streaming")]
+fn current_default_microphone_device_id() -> Option<String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    cached_default_host()
+        .default_input_device()?
+        .id()
+        .ok()
+        .map(|id| id.to_string())
+}
+
+#[cfg(feature = "streaming")]
+fn report_sustained_low_signal(notice: VoiceLowSignalNotice) {
+    let message = "The selected microphone is delivering sustained near-silence. Minutes will keep recording without switching microphones based on amplitude alone. Check the microphone mute/profile or choose another input if speech is missing.";
+    eprintln!("[minutes] {message}");
+    tracing::warn!(
+        source_generation = notice.source_generation,
+        discontinuity_epoch = notice.discontinuity_epoch,
+        peak_dbfs = notice.peak_dbfs,
+        rms_dbfs = notice.rms_dbfs,
+        "PocketStation microphone sustained near-silence observation"
+    );
+    if let Err(error) = crate::logging::append_log(&serde_json::json!({
+        "ts": chrono::Local::now().to_rfc3339(),
+        "level": "warn",
+        "step": "microphone_sustained_low_signal",
+        "source_generation": notice.source_generation,
+        "discontinuity_epoch": notice.discontinuity_epoch,
+        "peak_dbfs": notice.peak_dbfs,
+        "rms_dbfs": notice.rms_dbfs,
+        "message": message,
+    })) {
+        tracing::warn!(%error, "failed to persist microphone low-signal diagnostic");
+    }
+    send_silence_notification_msg(message);
+}
+
+#[cfg(feature = "streaming")]
+fn should_report_low_signal(
+    reported_continuity: &mut Option<(u32, u64)>,
+    notice: VoiceLowSignalNotice,
+) -> bool {
+    let continuity = (notice.source_generation, notice.discontinuity_epoch);
+    if *reported_continuity == Some(continuity) {
+        return false;
+    }
+    *reported_continuity = Some(continuity);
+    true
 }
 
 #[cfg(feature = "streaming")]
@@ -958,7 +1035,10 @@ fn resolve_capture_plan_with_host(
 
     #[cfg(feature = "streaming")]
     if let Some(call_override) = call_override {
-        let (_, voice_name) = select_device_with_override(host, voice_override.as_deref())?;
+        use cpal::traits::DeviceTrait;
+        let (voice_device, voice_name) =
+            select_device_with_override(host, voice_override.as_deref())?;
+        let voice_device_id = voice_device.id().ok().map(|id| id.to_string());
         let capture_backend = crate::system_audio_backend::configured_capture_backend(config)
             .map_err(|error| CaptureError::Io(std::io::Error::other(error)))?;
         if capture_backend == crate::system_audio_backend::CaptureBackendKind::CoreAudioTap {
@@ -971,6 +1051,7 @@ fn resolve_capture_plan_with_host(
             }
             return Ok(CapturePlan::Dual(DualCapturePlan {
                 voice_override,
+                voice_device_id,
                 voice_device_name: voice_name,
                 call_override: crate::system_audio_backend::CORE_AUDIO_TAP_CAPTURE_BACKEND.into(),
                 call_device_name: crate::system_audio_backend::CORE_AUDIO_TAP_ROUTE_NAME.into(),
@@ -985,6 +1066,7 @@ fn resolve_capture_plan_with_host(
             }
             return Ok(CapturePlan::Dual(DualCapturePlan {
                 voice_override,
+                voice_device_id,
                 voice_device_name: voice_name,
                 call_override: call_override.to_string(),
                 call_device_name: format!("PocketStation application: {call_override}"),
@@ -1006,6 +1088,7 @@ fn resolve_capture_plan_with_host(
         }
         return Ok(CapturePlan::Dual(DualCapturePlan {
             voice_override,
+            voice_device_id,
             voice_device_name: voice_name,
             call_override: resolved_call,
             call_device_name: call_name,
@@ -1920,6 +2003,7 @@ fn record_to_wav_dual_source(
     let mut voice_recovery_not_before = Instant::now();
     let mut voice_recovery_stage = VoiceRecoveryStage::ExactRetryAvailable;
     let mut minimum_voice_lineage: Option<VoiceLineageFloor> = None;
+    let mut reported_low_signal_continuity: Option<(u32, u64)> = None;
 
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -1962,6 +2046,14 @@ fn record_to_wav_dual_source(
         }
 
         let reported_device_issue = device_monitor.check_changes();
+        if let Some(notice) = voice_stream
+            .as_ref()
+            .and_then(VoiceCaptureStream::low_signal_notice)
+        {
+            if should_report_low_signal(&mut reported_low_signal_continuity, notice) {
+                report_sustained_low_signal(notice);
+            }
+        }
         if voice_stream
             .as_ref()
             .is_some_and(VoiceCaptureStream::recovery_confirmed)
@@ -2005,10 +2097,16 @@ fn record_to_wav_dual_source(
                 .is_some_and(VoiceCaptureStream::worker_failed);
             // An explicit microphone selection is an authorization boundary:
             // retry that physical source once, but never substitute another
-            // microphone without a separate user opt-in. Following the system
-            // default retains Minutes' existing default-device fallback policy.
-            let automatic_fallback_allowed =
+            // microphone without a separate user opt-in. A default-following
+            // session may follow the OS default only when it resolves to a
+            // different physical device.
+            let selection_allows_automatic_fallback =
                 automatic_microphone_fallback_allowed(plan.voice_override.as_deref());
+            let default_changed = default_microphone_changed(
+                plan.voice_device_id.as_deref(),
+                current_default_microphone_device_id().as_deref(),
+            );
+            let automatic_fallback_allowed = selection_allows_automatic_fallback && default_changed;
             let fallback_withheld = voice_recovery_stage == VoiceRecoveryStage::FallbackRequired
                 && !automatic_fallback_allowed;
             let action = recovery_action(
@@ -2079,6 +2177,20 @@ fn record_to_wav_dual_source(
                         error = %error,
                         "bounded voice recovery failed — continuing with the unaffected system stem"
                     );
+                    if action == Some(VoiceRecoveryAction::ReplaceWithFallback) {
+                        let message = "The microphone remained unusable and the system default did not provide a different input. Minutes is continuing system audio only. Choose another microphone or change the system default to recover voice capture.";
+                        eprintln!("[minutes] {message}");
+                        if let Err(log_error) = crate::logging::append_log(&serde_json::json!({
+                            "ts": chrono::Local::now().to_rfc3339(),
+                            "level": "warn",
+                            "step": "microphone_default_fallback_unavailable",
+                            "message": message,
+                            "error": error.to_string(),
+                        })) {
+                            tracing::warn!(%log_error, "failed to persist microphone fallback diagnostic");
+                        }
+                        send_silence_notification_msg(message);
+                    }
                     voice_recovery_stage = match action {
                         Some(
                             VoiceRecoveryAction::RestartWorker | VoiceRecoveryAction::ReopenExact,
@@ -2096,8 +2208,10 @@ fn record_to_wav_dual_source(
                 None => {
                     minimum_voice_lineage = None;
                     voice_recovery_stage = VoiceRecoveryStage::FallbackExhausted;
-                    let message = if fallback_withheld {
+                    let message = if fallback_withheld && !selection_allows_automatic_fallback {
                         "The selected microphone remained unusable after one exact retry. Minutes will not replace an explicitly selected microphone without your approval, so the healthy system-audio stem is continuing in degraded mode. Choose another microphone to recover voice capture."
+                    } else if fallback_withheld {
+                        "The microphone remained unusable after one exact retry, and the system default still resolves to the same physical input. Minutes is continuing system audio only. Choose another microphone or change the system default to recover voice capture."
                     } else {
                         "The microphone remained unusable after one exact retry and one explicit fallback. Minutes is continuing the healthy system-audio stem in degraded mode."
                     };
@@ -4578,10 +4692,17 @@ mod tests {
     #[cfg(feature = "streaming")]
     #[test]
     fn default_following_microphone_retries_then_falls_back_once() {
-        let automatic_fallback_allowed = automatic_microphone_fallback_allowed(None);
+        let selection_allows_fallback = automatic_microphone_fallback_allowed(None);
+        let automatic_fallback_allowed = selection_allows_fallback
+            && default_microphone_changed(Some("failed-uid"), Some("new-default-uid"));
         assert!(automatic_fallback_allowed);
         assert!(automatic_microphone_fallback_allowed(Some("default")));
         assert!(automatic_microphone_fallback_allowed(Some(" DEFAULT ")));
+        assert!(!default_microphone_changed(
+            Some("failed-uid"),
+            Some("failed-uid")
+        ));
+        assert!(!default_microphone_changed(None, Some("new-default-uid")));
         assert_eq!(
             recovery_action(
                 VoiceRecoveryStage::ExactRetryAvailable,
@@ -4637,6 +4758,17 @@ mod tests {
             ),
             Some(VoiceRecoveryAction::ReplaceWithFallback)
         );
+        assert_eq!(
+            recovery_action(
+                VoiceRecoveryStage::FallbackRequired,
+                false,
+                false,
+                selection_allows_fallback
+                    && default_microphone_changed(Some("failed-uid"), Some("failed-uid")),
+            ),
+            None,
+            "an unchanged OS default cannot authorize arbitrary replacement"
+        );
         assert!(continue_without_voice(true, false));
         assert!(!continue_without_voice(false, false));
     }
@@ -4680,6 +4812,31 @@ mod tests {
             None,
             "an explicitly selected microphone degrades instead of being replaced"
         );
+    }
+
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn low_signal_warning_is_emitted_once_per_source_continuity() {
+        let mut reported = None;
+        let notice = VoiceLowSignalNotice {
+            source_generation: 1,
+            discontinuity_epoch: 0,
+            peak_dbfs: Some(-78.3),
+            rms_dbfs: Some(-91.0),
+        };
+
+        assert!(should_report_low_signal(&mut reported, notice));
+        // A temporary threshold recovery does not clear `reported`; seeing the
+        // same low-signal continuity again therefore remains de-duplicated.
+        assert!(!should_report_low_signal(&mut reported, notice));
+        assert!(should_report_low_signal(
+            &mut reported,
+            VoiceLowSignalNotice {
+                source_generation: 2,
+                discontinuity_epoch: 1,
+                ..notice
+            }
+        ));
     }
 
     #[cfg(feature = "streaming")]

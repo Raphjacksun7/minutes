@@ -20,9 +20,9 @@ const EXACT_ZERO_TIMEOUT: Duration = Duration::from_millis(1_500);
 const MINIMUM_PEAK_DBFS: f64 = -45.0;
 const MINIMUM_RMS_DBFS: f64 = -55.0;
 // #1057's failed Logi HFP stem was not bit-exact zero: its measured peak was
-// -78.3 dBFS and its mean level was -91 dBFS. Keep this failure threshold well
-// below ordinary quiet speech, and require it to persist before asking the host
-// to recover the source.
+// -78.3 dBFS and its mean level was -91 dBFS. Keep this observation threshold
+// well below ordinary quiet speech, and require it to persist before warning
+// the user. Amplitude alone never authorizes source recovery.
 const UNUSABLE_LOW_SIGNAL_MAXIMUM_PEAK_DBFS: f64 = -70.0;
 const UNUSABLE_LOW_SIGNAL_MAXIMUM_RMS_DBFS: f64 = -80.0;
 const UNUSABLE_LOW_SIGNAL_TIMEOUT: Duration = Duration::from_millis(1_500);
@@ -71,6 +71,23 @@ impl Default for MicrophoneObservations {
             source_generation: 1,
             discontinuity_epoch: 0,
         }
+    }
+}
+
+impl MicrophoneObservations {
+    pub(crate) fn requires_recovery(self) -> bool {
+        matches!(
+            self.state,
+            MicrophoneSignalState::NoFrames
+                | MicrophoneSignalState::Stalled
+                | MicrophoneSignalState::DigitallySilent
+                | MicrophoneSignalState::NonFiniteSamples
+                | MicrophoneSignalState::SourceFailed
+        )
+    }
+
+    pub(crate) fn confirms_recovery(self) -> bool {
+        self.state == MicrophoneSignalState::SignalObserved
     }
 }
 
@@ -162,11 +179,10 @@ impl MicrophoneSelection {
         resolved_default_name: &str,
     ) -> Result<Self, CaptureError> {
         let default = Self::resolve(None, resolved_default_name).ok();
-        let alternatives = discovered_microphones();
-        choose_recovery_fallback(current_device_id, default, alternatives).ok_or_else(|| {
+        choose_recovery_fallback(current_device_id, default).ok_or_else(|| {
             capture_error(
                 "select PocketStation microphone fallback",
-                "no alternative input device is available",
+                "the system default input still resolves to the failed microphone; choose another microphone to continue voice capture",
             )
         })
     }
@@ -216,24 +232,99 @@ fn discovered_microphones() -> Vec<MicrophoneSelection> {
 fn choose_recovery_fallback(
     current_device_id: Option<&str>,
     default: Option<MicrophoneSelection>,
-    mut alternatives: Vec<MicrophoneSelection>,
 ) -> Option<MicrophoneSelection> {
-    if let Some(default) = default {
-        if current_device_id.is_none_or(|current| default.device_id != current) {
-            return Some(default);
+    let current_device_id = current_device_id?;
+    default.filter(|default| default.device_id != current_device_id)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SignalWindowContinuity {
+    source_generation: u32,
+    discontinuity_epoch: u64,
+    samples_observed_total: u64,
+}
+
+impl From<SessionSourceSignalObservations> for SignalWindowContinuity {
+    fn from(observations: SessionSourceSignalObservations) -> Self {
+        Self {
+            source_generation: observations.window_source_generation,
+            discontinuity_epoch: observations.window_discontinuity_epoch,
+            samples_observed_total: observations.samples_observed_total,
         }
     }
+}
 
-    alternatives
-        .retain(|candidate| current_device_id.is_none_or(|current| candidate.device_id != current));
-    alternatives.sort_by_key(|candidate| {
-        let normalized = candidate.display_name.to_ascii_lowercase();
-        let looks_built_in = normalized.contains("built-in")
-            || normalized.contains("internal")
-            || normalized.contains("macbook");
-        (!looks_built_in, normalized)
-    });
-    alternatives.into_iter().next()
+#[derive(Debug, Default)]
+struct ObservationContinuityTracker {
+    continuity: Option<(u32, u64)>,
+    started_at_ns: u64,
+    activity_frames_baseline: u64,
+    signal_samples_baseline: u64,
+}
+
+impl ObservationContinuityTracker {
+    fn project_activity(
+        &mut self,
+        activity: Option<SessionSourceActivityObservations>,
+        signal: Option<SignalWindowContinuity>,
+        source_generation: u32,
+        discontinuity_epoch: u64,
+    ) -> (Option<SessionSourceActivityObservations>, bool) {
+        let continuity = (source_generation, discontinuity_epoch);
+        if self.continuity != Some(continuity) {
+            let first_attachment = self.continuity.is_none();
+            self.continuity = Some(continuity);
+            self.started_at_ns = activity.map_or(0, |entry| {
+                if first_attachment {
+                    entry.session_started_at_ns
+                } else {
+                    entry.observed_at_ns
+                }
+            });
+            self.activity_frames_baseline = if first_attachment {
+                0
+            } else {
+                activity.map_or(0, |entry| entry.frames_received_total)
+            };
+            self.signal_samples_baseline = if first_attachment {
+                0
+            } else {
+                signal.map_or(0, |entry| entry.samples_observed_total)
+            };
+        }
+        if self.started_at_ns == 0 {
+            self.started_at_ns = activity.map_or(0, |entry| entry.observed_at_ns);
+        }
+
+        let current_signal_observed = signal.is_some_and(|entry| {
+            entry.source_generation == source_generation
+                && entry.discontinuity_epoch == discontinuity_epoch
+                && entry.samples_observed_total > self.signal_samples_baseline
+        });
+        let projected_activity = activity.map(|entry| {
+            let frames_received_total = entry
+                .frames_received_total
+                .saturating_sub(self.activity_frames_baseline);
+            let current_frame_observed = current_signal_observed && frames_received_total > 0;
+            let latest_frame_received_at_ns = if current_frame_observed {
+                entry.latest_frame_received_at_ns
+            } else {
+                None
+            };
+            SessionSourceActivityObservations {
+                session_started_at_ns: self.started_at_ns,
+                observed_at_ns: entry.observed_at_ns,
+                first_frame_received_at_ns: latest_frame_received_at_ns,
+                latest_frame_received_at_ns,
+                frames_received_total: if current_frame_observed {
+                    frames_received_total
+                } else {
+                    0
+                },
+            }
+        });
+        (projected_activity, current_signal_observed)
+    }
 }
 
 #[derive(Clone)]
@@ -290,16 +381,11 @@ impl PocketStationMicrophoneStream {
     }
 
     pub(crate) fn start_fallback(
-        device_override: Option<&str>,
+        previous_device_id: Option<&str>,
         resolved_default_name: &str,
     ) -> Result<Self, CaptureError> {
-        let current = MicrophoneSelection::resolve(device_override, resolved_default_name).ok();
-        let fallback = MicrophoneSelection::recovery_fallback(
-            current
-                .as_ref()
-                .map(|selection| selection.device_id.as_str()),
-            resolved_default_name,
-        )?;
+        let fallback =
+            MicrophoneSelection::recovery_fallback(previous_device_id, resolved_default_name)?;
         Self::start_selection(fallback)
     }
 
@@ -398,6 +484,7 @@ impl PocketStationMicrophoneStream {
                 .expect("fixed microphone signal policy must be valid");
                 let mut writer = MicrophoneAudioChunkWriter::default();
                 let mut low_signal_tracker = LowSignalTracker::default();
+                let mut observation_continuity = ObservationContinuityTracker::default();
                 let mut diagnostic_identity = diagnostic_identity;
                 let mut logged_native_format_attachment = None;
                 let mut pending_format_continuity = None;
@@ -521,6 +608,7 @@ impl PocketStationMicrophoneStream {
                         activity_policy,
                         signal_policy,
                         &mut low_signal_tracker,
+                        &mut observation_continuity,
                         source_failed.load(Ordering::Relaxed),
                         &observations,
                     ) {
@@ -665,6 +753,7 @@ fn update_observations(
     activity_policy: SessionSourceActivityPolicy,
     signal_policy: SessionSourceSignalPolicy,
     low_signal_tracker: &mut LowSignalTracker,
+    observation_continuity: &mut ObservationContinuityTracker,
     source_failed: bool,
     observations: &Mutex<MicrophoneObservations>,
 ) -> Option<MicrophoneObservations> {
@@ -678,14 +767,21 @@ fn update_observations(
     }) else {
         return None;
     };
-    let activity = snapshot.source_activity(source_index).copied();
-    let signal = snapshot.source_signal(source_index).copied();
+    let raw_activity = snapshot.source_activity(source_index).copied();
+    let raw_signal = snapshot.source_signal(source_index).copied();
     let replacement = snapshot.source_replacement(source_index).copied();
     let native_format = snapshot
         .source_native_format(source_index)
         .and_then(|entry| entry.opened_native_format);
     let source_generation = replacement.map_or(1, |entry| entry.source_generation);
     let discontinuity_epoch = replacement.map_or(0, |entry| entry.discontinuity_epoch);
+    let (activity, current_signal_observed) = observation_continuity.project_activity(
+        raw_activity,
+        raw_signal.map(SignalWindowContinuity::from),
+        source_generation,
+        discontinuity_epoch,
+    );
+    let signal = current_signal_observed.then_some(raw_signal).flatten();
     let state = evaluate_observations(
         activity,
         signal,
@@ -1297,11 +1393,10 @@ mod tests {
     }
 
     #[test]
-    fn fallback_uses_the_default_when_the_original_device_disappeared() {
+    fn fallback_follows_an_os_default_that_changed_physical_device() {
         let fallback = choose_recovery_fallback(
-            None,
+            Some("headset-uid"),
             Some(selection("builtin-uid", "MacBook Microphone")),
-            vec![selection("usb-uid", "USB Microphone")],
         )
         .unwrap();
 
@@ -1310,18 +1405,17 @@ mod tests {
     }
 
     #[test]
-    fn fallback_excludes_the_current_device_and_prefers_a_built_in_input() {
-        let fallback = choose_recovery_fallback(
+    fn fallback_does_not_invent_an_alternative_when_os_default_is_unchanged() {
+        assert!(choose_recovery_fallback(
             Some("headset-uid"),
             Some(selection("headset-uid", "Logi HFP")),
-            vec![
-                selection("usb-uid", "USB Microphone"),
-                selection("builtin-uid", "Built-in Microphone"),
-            ],
         )
-        .unwrap();
-
-        assert_eq!(fallback.device_id, "builtin-uid");
+        .is_none());
+        assert!(choose_recovery_fallback(
+            None,
+            Some(selection("builtin-uid", "Built-in Microphone")),
+        )
+        .is_none());
     }
 
     #[test]
@@ -1345,7 +1439,7 @@ mod tests {
     }
 
     #[test]
-    fn reported_hfp_noise_envelope_requires_bounded_low_signal_recovery() {
+    fn reported_hfp_noise_envelope_requires_bounded_low_signal_warning() {
         let mut tracker = LowSignalTracker::default();
         let timeout_ns = UNUSABLE_LOW_SIGNAL_TIMEOUT.as_nanos() as u64;
 
@@ -1405,6 +1499,102 @@ mod tests {
             MicrophoneSignalState::BelowThresholds,
             "a discontinuity starts a new bounded interval"
         );
+    }
+
+    #[test]
+    fn sustained_low_signal_warns_but_does_not_authorize_source_recovery() {
+        let observations = MicrophoneObservations {
+            state: MicrophoneSignalState::SustainedLowSignal,
+            ..MicrophoneObservations::default()
+        };
+
+        assert!(!observations.requires_recovery());
+        assert!(!observations.confirms_recovery());
+    }
+
+    #[test]
+    fn stale_good_window_cannot_confirm_a_replacement_without_a_current_frame() {
+        let (activity_policy, _) = policies();
+        let mut continuity = ObservationContinuityTracker::default();
+        let old_activity = SessionSourceActivityObservations {
+            session_started_at_ns: 1,
+            observed_at_ns: 1_000_000_000,
+            first_frame_received_at_ns: Some(900_000_000),
+            latest_frame_received_at_ns: Some(990_000_000),
+            frames_received_total: 1,
+        };
+        let old_good_window = SignalWindowContinuity {
+            source_generation: 1,
+            discontinuity_epoch: 0,
+            samples_observed_total: 480,
+        };
+
+        let (initial_activity, initial_signal_is_current) =
+            continuity.project_activity(Some(old_activity), Some(old_good_window), 1, 0);
+        assert!(initial_signal_is_current);
+        assert_eq!(
+            initial_activity.unwrap().evaluate(activity_policy).state,
+            SessionSourceActivityState::Active
+        );
+        assert!(MicrophoneObservations {
+            state: MicrophoneSignalState::SignalObserved,
+            source_generation: 1,
+            discontinuity_epoch: 0,
+            ..MicrophoneObservations::default()
+        }
+        .confirms_recovery());
+
+        let (replacement_activity, replacement_signal_is_current) = continuity.project_activity(
+            Some(SessionSourceActivityObservations {
+                observed_at_ns: 1_100_000_000,
+                ..old_activity
+            }),
+            Some(old_good_window),
+            2,
+            1,
+        );
+        assert!(!replacement_signal_is_current);
+        let replacement_state = classify_evaluations(
+            replacement_activity.map(|entry| entry.evaluate(activity_policy).state),
+            None,
+            false,
+        );
+        assert_eq!(replacement_state, MicrophoneSignalState::AwaitingFirstFrame);
+        assert!(!MicrophoneObservations {
+            state: replacement_state,
+            source_generation: 2,
+            discontinuity_epoch: 1,
+            ..MicrophoneObservations::default()
+        }
+        .confirms_recovery());
+
+        let (current_activity, current_signal_is_current) = continuity.project_activity(
+            Some(SessionSourceActivityObservations {
+                observed_at_ns: 1_200_000_000,
+                latest_frame_received_at_ns: Some(1_190_000_000),
+                frames_received_total: 2,
+                ..old_activity
+            }),
+            Some(SignalWindowContinuity {
+                source_generation: 2,
+                discontinuity_epoch: 1,
+                samples_observed_total: 960,
+            }),
+            2,
+            1,
+        );
+        assert!(current_signal_is_current);
+        assert_eq!(
+            current_activity.unwrap().evaluate(activity_policy).state,
+            SessionSourceActivityState::Active
+        );
+        assert!(MicrophoneObservations {
+            state: MicrophoneSignalState::SignalObserved,
+            source_generation: 2,
+            discontinuity_epoch: 1,
+            ..MicrophoneObservations::default()
+        }
+        .confirms_recovery());
     }
 
     #[test]
