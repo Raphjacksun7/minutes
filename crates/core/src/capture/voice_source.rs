@@ -1,7 +1,6 @@
-use super::voice_types::{
-    VoiceLineageFloor, VoiceLowSignalNotice, VoiceRecoveryAction, VoiceRecoveryContext,
-    VoiceSourceHealth,
-};
+use super::voice_types::{VoiceLineageFloor, VoiceLowSignalNotice, VoiceRecoveryAction};
+#[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
+use super::voice_types::{VoiceRecoveryContext, VoiceSourceHealth};
 use super::DualCapturePlan;
 #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
 use super::{cached_default_host, select_device_with_override};
@@ -186,8 +185,8 @@ impl VoiceCaptureStream {
         }
     }
 
+    #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
     pub(super) fn recovery_context(&self) -> Option<VoiceRecoveryContext> {
-        #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
         match self {
             Self::Cpal(_) => None,
             Self::PocketStation(stream) => {
@@ -250,8 +249,6 @@ impl VoiceCaptureStream {
                 })
             }
         }
-        #[cfg(not(all(feature = "pocketstation-capture", target_os = "macos")))]
-        None
     }
 
     pub(super) fn independent_failure(&self) -> bool {

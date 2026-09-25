@@ -16,12 +16,17 @@ mod voice_source;
 #[cfg(feature = "streaming")]
 mod voice_types;
 
+#[cfg(all(
+    feature = "streaming",
+    feature = "pocketstation-capture",
+    target_os = "macos"
+))]
+use voice_recovery::report_recovery_context;
 #[cfg(feature = "streaming")]
 use voice_recovery::{
     active_microphone_device_id, automatic_microphone_fallback_allowed, continue_without_voice,
     current_default_microphone_device_id, default_microphone_changed, microphone_degraded_message,
-    recovery_action, report_recovery_context, report_sustained_low_signal,
-    should_report_low_signal,
+    recovery_action, report_sustained_low_signal, should_report_low_signal,
 };
 #[cfg(all(test, feature = "streaming"))]
 use voice_source::recovery_lineage_floor;
@@ -1809,6 +1814,7 @@ fn record_to_wav_dual_source(
                 .as_ref()
                 .map(VoiceCaptureStream::device_name)
                 .map(str::to_owned);
+            #[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
             if let Some(context) = voice_stream
                 .as_ref()
                 .and_then(VoiceCaptureStream::recovery_context)

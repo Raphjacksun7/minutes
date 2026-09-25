@@ -1,7 +1,8 @@
 use super::voice_types::{
-    MicrophoneDegradedReason, VoiceLowSignalNotice, VoiceRecoveryAction, VoiceRecoveryContext,
-    VoiceRecoveryStage, VoiceSourceHealth,
+    MicrophoneDegradedReason, VoiceLowSignalNotice, VoiceRecoveryAction, VoiceRecoveryStage,
 };
+#[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
+use super::voice_types::{VoiceRecoveryContext, VoiceSourceHealth};
 use super::{cached_default_host, send_silence_notification_msg};
 
 pub(super) fn recovery_action(
@@ -58,6 +59,7 @@ pub(super) fn current_default_microphone_device_id() -> Option<String> {
         .map(|id| id.to_string())
 }
 
+#[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
 pub(super) fn report_recovery_context(context: VoiceRecoveryContext) {
     eprintln!(
         "[minutes] PocketStation microphone recovery reason: {:?}",

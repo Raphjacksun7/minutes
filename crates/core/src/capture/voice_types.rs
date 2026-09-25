@@ -34,6 +34,7 @@ pub(super) struct VoiceLowSignalNotice {
     pub(super) rms_dbfs: Option<f64>,
 }
 
+#[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum VoiceSourceHealth {
     AwaitingFirstFrame,
@@ -49,6 +50,7 @@ pub(super) enum VoiceSourceHealth {
     SourceFailed,
 }
 
+#[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct VoiceNativeFormat {
     pub(super) sample_rate_hz: u32,
@@ -56,6 +58,7 @@ pub(super) struct VoiceNativeFormat {
     pub(super) sample_representation: &'static str,
 }
 
+#[cfg(all(feature = "pocketstation-capture", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct VoiceRecoveryContext {
     pub(super) health: VoiceSourceHealth,
