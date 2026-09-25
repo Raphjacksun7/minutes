@@ -327,6 +327,100 @@ impl ObservationContinuityTracker {
     }
 }
 
+struct MicrophoneObservationEvaluator {
+    activity_policy: SessionSourceActivityPolicy,
+    signal_policy: SessionSourceSignalPolicy,
+    low_signal: LowSignalTracker,
+    continuity: ObservationContinuityTracker,
+}
+
+impl MicrophoneObservationEvaluator {
+    fn new(
+        activity_policy: SessionSourceActivityPolicy,
+        signal_policy: SessionSourceSignalPolicy,
+    ) -> Self {
+        Self {
+            activity_policy,
+            signal_policy,
+            low_signal: LowSignalTracker::default(),
+            continuity: ObservationContinuityTracker::default(),
+        }
+    }
+
+    fn update_observations(
+        &mut self,
+        running: &pocketstation::RunningSession,
+        stem_id: StemId,
+        source_failed: bool,
+        observations: &Mutex<MicrophoneObservations>,
+    ) -> Option<MicrophoneObservations> {
+        let snapshot = running.metrics_snapshot().ok()?;
+        let source_index = (0..snapshot.source_count()).find(|&index| {
+            snapshot
+                .source(index)
+                .is_some_and(|source| source.stem_id == stem_id)
+        })?;
+        let raw_activity = snapshot.source_activity(source_index).copied();
+        let raw_signal = snapshot.source_signal(source_index).copied();
+        let replacement = snapshot.source_replacement(source_index).copied();
+        let native_format = snapshot
+            .source_native_format(source_index)
+            .and_then(|entry| entry.opened_native_format);
+        let source_generation = replacement.map_or(1, |entry| entry.source_generation);
+        let discontinuity_epoch = replacement.map_or(0, |entry| entry.discontinuity_epoch);
+        let (activity, current_signal_observed) = self.continuity.project_activity(
+            raw_activity,
+            raw_signal.map(SignalWindowContinuity::from),
+            source_generation,
+            discontinuity_epoch,
+        );
+        let signal = current_signal_observed.then_some(raw_signal).flatten();
+        let state = self.evaluate_observations(
+            activity,
+            signal,
+            source_generation,
+            discontinuity_epoch,
+            source_failed,
+        );
+        let observation_snapshot = MicrophoneObservations {
+            state,
+            native_format,
+            activity,
+            signal,
+            source_generation,
+            discontinuity_epoch,
+        };
+        if let Ok(mut current) = observations.lock() {
+            *current = observation_snapshot;
+        }
+        Some(observation_snapshot)
+    }
+
+    fn evaluate_observations(
+        &mut self,
+        activity: Option<SessionSourceActivityObservations>,
+        signal: Option<SessionSourceSignalObservations>,
+        source_generation: u32,
+        discontinuity_epoch: u64,
+        source_failed: bool,
+    ) -> MicrophoneSignalState {
+        let activity_state = activity.map(|activity| activity.evaluate(self.activity_policy).state);
+        let signal_evaluation = signal.map(|signal| signal.evaluate(self.signal_policy));
+        evaluate_state(
+            activity_state,
+            signal_evaluation,
+            signal.map_or_else(
+                || activity.map_or(0, |entry| entry.observed_at_ns),
+                |entry| entry.observed_at_ns,
+            ),
+            &mut self.low_signal,
+            source_generation,
+            discontinuity_epoch,
+            source_failed,
+        )
+    }
+}
+
 #[derive(Clone)]
 struct MicrophoneDiagnosticIdentity {
     device_id: String,
@@ -483,8 +577,8 @@ impl PocketStationMicrophoneStream {
                 )
                 .expect("fixed microphone signal policy must be valid");
                 let mut writer = MicrophoneAudioChunkWriter::default();
-                let mut low_signal_tracker = LowSignalTracker::default();
-                let mut observation_continuity = ObservationContinuityTracker::default();
+                let mut observation_evaluator =
+                    MicrophoneObservationEvaluator::new(activity_policy, signal_policy);
                 let mut diagnostic_identity = diagnostic_identity;
                 let mut logged_native_format_attachment = None;
                 let mut pending_format_continuity = None;
@@ -602,13 +696,9 @@ impl PocketStationMicrophoneStream {
                         }
                     }
 
-                    if let Some(current_observations) = update_observations(
+                    if let Some(current_observations) = observation_evaluator.update_observations(
                         &running,
                         stem_id,
-                        activity_policy,
-                        signal_policy,
-                        &mut low_signal_tracker,
-                        &mut observation_continuity,
                         source_failed.load(Ordering::Relaxed),
                         &observations,
                     ) {
@@ -745,91 +835,6 @@ fn stop_cancel_and_join(
             false
         }
     }
-}
-
-fn update_observations(
-    running: &pocketstation::RunningSession,
-    stem_id: StemId,
-    activity_policy: SessionSourceActivityPolicy,
-    signal_policy: SessionSourceSignalPolicy,
-    low_signal_tracker: &mut LowSignalTracker,
-    observation_continuity: &mut ObservationContinuityTracker,
-    source_failed: bool,
-    observations: &Mutex<MicrophoneObservations>,
-) -> Option<MicrophoneObservations> {
-    let Ok(snapshot) = running.metrics_snapshot() else {
-        return None;
-    };
-    let Some(source_index) = (0..snapshot.source_count()).find(|&index| {
-        snapshot
-            .source(index)
-            .is_some_and(|source| source.stem_id == stem_id)
-    }) else {
-        return None;
-    };
-    let raw_activity = snapshot.source_activity(source_index).copied();
-    let raw_signal = snapshot.source_signal(source_index).copied();
-    let replacement = snapshot.source_replacement(source_index).copied();
-    let native_format = snapshot
-        .source_native_format(source_index)
-        .and_then(|entry| entry.opened_native_format);
-    let source_generation = replacement.map_or(1, |entry| entry.source_generation);
-    let discontinuity_epoch = replacement.map_or(0, |entry| entry.discontinuity_epoch);
-    let (activity, current_signal_observed) = observation_continuity.project_activity(
-        raw_activity,
-        raw_signal.map(SignalWindowContinuity::from),
-        source_generation,
-        discontinuity_epoch,
-    );
-    let signal = current_signal_observed.then_some(raw_signal).flatten();
-    let state = evaluate_observations(
-        activity,
-        signal,
-        activity_policy,
-        signal_policy,
-        low_signal_tracker,
-        source_generation,
-        discontinuity_epoch,
-        source_failed,
-    );
-    let observation_snapshot = MicrophoneObservations {
-        state,
-        native_format,
-        activity,
-        signal,
-        source_generation,
-        discontinuity_epoch,
-    };
-    if let Ok(mut current) = observations.lock() {
-        *current = observation_snapshot;
-    }
-    Some(observation_snapshot)
-}
-
-fn evaluate_observations(
-    activity: Option<SessionSourceActivityObservations>,
-    signal: Option<SessionSourceSignalObservations>,
-    activity_policy: SessionSourceActivityPolicy,
-    signal_policy: SessionSourceSignalPolicy,
-    low_signal_tracker: &mut LowSignalTracker,
-    source_generation: u32,
-    discontinuity_epoch: u64,
-    source_failed: bool,
-) -> MicrophoneSignalState {
-    let activity_state = activity.map(|activity| activity.evaluate(activity_policy).state);
-    let signal_evaluation = signal.map(|signal| signal.evaluate(signal_policy));
-    evaluate_state(
-        activity_state,
-        signal_evaluation,
-        signal.map_or_else(
-            || activity.map_or(0, |entry| entry.observed_at_ns),
-            |entry| entry.observed_at_ns,
-        ),
-        low_signal_tracker,
-        source_generation,
-        discontinuity_epoch,
-        source_failed,
-    )
 }
 
 fn evaluate_state(
@@ -1281,14 +1286,11 @@ mod tests {
     #[test]
     fn activity_facts_distinguish_waiting_no_frames_active_and_stalled() {
         let (activity_policy, signal_policy) = policies();
-        let mut low_signal_tracker = LowSignalTracker::default();
+        let mut evaluator = MicrophoneObservationEvaluator::new(activity_policy, signal_policy);
         assert_eq!(
-            evaluate_observations(
+            evaluator.evaluate_observations(
                 Some(activity(1_000_000_000, None, None)),
                 None,
-                activity_policy,
-                signal_policy,
-                &mut low_signal_tracker,
                 1,
                 0,
                 false,
@@ -1296,12 +1298,9 @@ mod tests {
             MicrophoneSignalState::AwaitingFirstFrame
         );
         assert_eq!(
-            evaluate_observations(
+            evaluator.evaluate_observations(
                 Some(activity(3_000_000_000, None, None)),
                 None,
-                activity_policy,
-                signal_policy,
-                &mut low_signal_tracker,
                 1,
                 0,
                 false,
@@ -1309,16 +1308,13 @@ mod tests {
             MicrophoneSignalState::NoFrames
         );
         assert_eq!(
-            evaluate_observations(
+            evaluator.evaluate_observations(
                 Some(activity(
                     1_500_000_000,
                     Some(500_000_000),
                     Some(1_000_000_000),
                 )),
                 None,
-                activity_policy,
-                signal_policy,
-                &mut low_signal_tracker,
                 1,
                 0,
                 false,
@@ -1326,16 +1322,13 @@ mod tests {
             MicrophoneSignalState::Active
         );
         assert_eq!(
-            evaluate_observations(
+            evaluator.evaluate_observations(
                 Some(activity(
                     4_000_000_000,
                     Some(500_000_000),
                     Some(1_000_000_000),
                 )),
                 None,
-                activity_policy,
-                signal_policy,
-                &mut low_signal_tracker,
                 1,
                 0,
                 false,
@@ -1347,18 +1340,9 @@ mod tests {
     #[test]
     fn source_failure_is_not_relabelled_as_silence() {
         let (activity_policy, signal_policy) = policies();
-        let mut low_signal_tracker = LowSignalTracker::default();
+        let mut evaluator = MicrophoneObservationEvaluator::new(activity_policy, signal_policy);
         assert_eq!(
-            evaluate_observations(
-                None,
-                None,
-                activity_policy,
-                signal_policy,
-                &mut low_signal_tracker,
-                1,
-                0,
-                true,
-            ),
+            evaluator.evaluate_observations(None, None, 1, 0, true),
             MicrophoneSignalState::SourceFailed
         );
     }
